@@ -9,8 +9,19 @@ on:
         description: 'Simple string parameter'
         default: 'String parameter'
         required: true
+      id:
+        description: 'run identifier'
+        default: 'no-id'
+        type: string
+        required: false
 
 jobs:
+  id:
+    name: Workflow ID ${{ github.event.inputs.id }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: ${{ github.event.inputs.id }}
+        run: echo run identifier ${{ github.event.inputs.id }}
   build:
     runs-on: ubuntu-latest
     steps:

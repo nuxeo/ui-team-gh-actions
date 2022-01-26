@@ -1,0 +1,35 @@
+name: Trigger Workflow
+
+on: 
+  push: 
+    branches:
+      - main
+    paths:
+      - 'trigger-workflow/**.*'
+  pull_request:
+    branches:
+      - main
+    paths:
+    - 'trigger-workflow/**.*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Trigger workflow with dispatch event
+        uses: ./trigger-workflow
+        with:
+          owner: nuxeo
+          repo: ui-team-gh-actions
+          branch-name: WEBUI-655-trigger-workflow-action
+          access-token: ${{ secrets.GITHUB_TOKEN }}
+          workflow-id: dispatch.yaml
+          poll-interval: '1000'
+          inputs: |
+<<<<<<< Updated upstream
+            string-parameter: 'Run triggered with workflow_dispatch event'
+=======
+            string_parameter: 'Run triggered with workflow_dispatch event'
+>>>>>>> Stashed changes
