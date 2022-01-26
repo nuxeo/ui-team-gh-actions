@@ -1,3 +1,5 @@
+# Test workflow for the trigger-workflow action.
+# It requests and waits for the execution of the 'dispatch.yaml' workflow using the workflow_dispatch event.
 name: Trigger Workflow
 
 on: 
@@ -28,8 +30,4 @@ jobs:
           workflow-id: dispatch.yaml
           poll-interval: '1000'
           inputs: |
-<<<<<<< Updated upstream
-            string-parameter: 'Run triggered with workflow_dispatch event'
-=======
             string_parameter: 'Run triggered with workflow_dispatch event'
->>>>>>> Stashed changes
