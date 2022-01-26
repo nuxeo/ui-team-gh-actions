@@ -1,0 +1,13 @@
+{
+  "name": "trigger-workflow-js",
+  "version": "1.0.0",
+  "description": "JS action to trigger a workflow run through GH REST API",
+  "main": "index.js",
+  "scripts": {},
+  "author": "Nuxeo",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@actions/core": "^1.6.0",
+    "@actions/github": "^5.0.0"
+  }
+}

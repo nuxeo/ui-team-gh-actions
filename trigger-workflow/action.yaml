@@ -1,0 +1,28 @@
+name: 'Trigger workflow'
+description: 'Trigger a workflow run using the dispatch event through GH REST API'
+inputs:
+  owner:
+    description: 'owner'
+    required: true
+  repo:
+    description: 'repo'
+    required: true
+  branch-name:
+    description: 'branch name'
+    required: true
+  access-token:
+    description: 'Access token'
+    required: true
+  workflow-id:
+    description: 'The id of the worflow to run'
+    required: true
+  poll-interval:
+    description: 'Time between polls for workflow completion'
+    default: '60000'
+    required: false
+  inputs:
+    description: 'Workflow inputs'
+    required: false
+runs:
+  using: 'node16'
+  main: 'index.js'
