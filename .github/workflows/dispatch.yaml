@@ -1,0 +1,18 @@
+# Sample workflow for testing the trigger-workflow action, 
+# not intended to be triggered manually.
+name: Simple workflow with dispatch trigger
+
+on:
+  workflow_dispatch:
+    inputs:
+      string_parameter:
+        description: 'Simple string parameter'
+        default: 'String parameter'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo string parameter
+        run: echo ${{ github.event.inputs.string_parameter }}
