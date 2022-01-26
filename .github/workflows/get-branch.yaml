@@ -1,0 +1,48 @@
+name: Get Branch
+
+on: 
+  push: 
+    branches:
+      - main
+    paths:
+      - 'get-branch/**.*'
+  pull_request:
+    branches:
+      - main
+    paths:
+    - 'get-branch/**.*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Get main branch
+        id: pick_main_branch
+        uses: ./get-branch
+        with:
+          repository: nuxeo/ui-team-gh-actions
+          branch: non-existent-branch
+          default-branch: main
+
+      - name: Assert main branch name
+        if: ${{ steps.pick_main_branch.outputs.branch != 'main' }}
+        run: |
+          echo 'Branch name should be "main", but was ${{ steps.pick_main_branch.outputs.branch }}'
+          exit 1
+
+      - name: Get ref branch
+        if: ${{ github.event_name == 'pull_request' }}
+        id: pick_ref_branch
+        uses: ./get-branch
+        with:
+          repository: nuxeo/ui-team-gh-actions
+          branch: ${{ github.head_ref }}
+          default-branch: main
+
+      - name: Assert ref branch name
+        if: ${{ github.event_name == 'pull_request' && steps.pick_ref_branch.outputs.branch != github.head_ref }}
+        run: |
+          echo 'Branch name should be "${{ github.head_ref }}", but was ${{ steps.pick_ref_branch.outputs.branch }}'
+          exit 1
