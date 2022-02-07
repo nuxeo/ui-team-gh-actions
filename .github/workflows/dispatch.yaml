@@ -9,20 +9,21 @@ on:
         description: 'Simple string parameter'
         default: 'String parameter'
         required: true
-      id:
-        description: 'run identifier'
-        default: 'no-id'
+      caller_id:
+        description: 'Remote caller id'
         type: string
         required: false
 
 jobs:
-  id:
-    name: Workflow ID ${{ github.event.inputs.id }}
+  remote-call:
+    name: Remote Caller ID ${{ github.event.inputs.caller_id }}
+    if: ${{ github.event.inputs.caller_id }}
     runs-on: ubuntu-latest
     steps:
-      - name: ${{ github.event.inputs.id }}
-        run: echo run identifier ${{ github.event.inputs.id }}
+      - name: ${{ github.event.inputs.caller_id }}
+        run: echo run identifier ${{ github.event.inputs.caller_id }}
   build:
+    needs: remote-call
     runs-on: ubuntu-latest
     steps:
       - name: Echo string parameter

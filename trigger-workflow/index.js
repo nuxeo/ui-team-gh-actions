@@ -17,6 +17,7 @@ const core = require('@actions/core');
 const github = require('@actions/github');
 
 let octokit;
+const SETUP_WF_LABEL = 'Remote Caller ID';
 
 function sleep(milliseconds) {
   return new Promise((r) => setTimeout(r, milliseconds));
@@ -40,26 +41,28 @@ async function getWorkflowRuns(owner, repo, workflowID) {
 async function getWorkflowRun(owner, repo, workflowID, srcWfRunID) {
   await sleep(10000);
 
-  let run;
   let activeRun;
   let i = 0;
-  let runs = await getWorkflowRuns(owner, repo, workflowID);
-  do {
-    await sleep(2000);
-    activeRun = runs[i++];
-    let { data: wfJobs } = await octokit.rest.actions.listJobsForWorkflowRun({
-      owner,
-      repo,
-      run_id: activeRun.id,
-    });
-
-    // get the id job
-    const job = wfJobs.jobs.find((j) => j.name === `Workflow ID ${srcWfRunID}`);
-    if (job) {
-      run = activeRun;
-    }
-  } while (runs.length > i);
-  return run;
+  // because the workflow run might have been delayed, we'll retry
+  for (let retries = 3; retries > 0; retries--) {
+    let runs = await getWorkflowRuns(owner, repo, workflowID);
+    do {
+      await sleep(2000);
+      activeRun = runs[i++];
+      let { data: wfJobs } = await octokit.rest.actions.listJobsForWorkflowRun({
+        owner,
+        repo,
+        run_id: activeRun.id,
+      });
+  
+      // get the id job
+      const job = wfJobs.jobs.find((j) => j.name === `${SETUP_WF_LABEL} ${srcWfRunID}`);
+      if (job) {
+        return activeRun;
+      }
+    } while (runs.length > i);
+  }
+  return activeRun;
 }
 
 /**
@@ -116,7 +119,7 @@ async function run() {
     const srcWfRunID = `${context.runId}-${Date.now().toString()}`;
     // setup the workflow inputs
     let inputs = {
-      id: srcWfRunID,
+      caller_id: srcWfRunID,
     };
     workflowInputs.forEach((input) => {
       const exprs = input.split(':');

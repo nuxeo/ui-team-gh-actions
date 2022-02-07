@@ -12,7 +12,7 @@ on:
     branches:
       - main
     paths:
-    - 'trigger-workflow/**.*'
+      - 'trigger-workflow/**.*'
 
 jobs:
   test:
@@ -26,7 +26,7 @@ jobs:
           owner: nuxeo
           repo: ui-team-gh-actions
           branch-name: WEBUI-655-trigger-workflow-action
-          access-token: ${{ secrets.GITHUB_TOKEN }}
+          access-token: ${{ secrets.ACCESS_TOKEN }}
           workflow-id: dispatch.yaml
           poll-interval: '1000'
           inputs: |
