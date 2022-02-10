@@ -25,7 +25,7 @@ jobs:
         with:
           owner: nuxeo
           repo: ui-team-gh-actions
-          branch-name: WEBUI-655-trigger-workflow-action
+          branch-name: main
           access-token: ${{ secrets.ACCESS_TOKEN }}
           workflow-id: dispatch.yaml
           poll-interval: '1000'
