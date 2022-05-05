@@ -144,6 +144,21 @@ async function run() {
 
     if (conclusion === 'success' && status === 'completed') {
       core.info(`Workflow ${status} with ${conclusion}`);
+
+      // get the output of the run if any is available
+      let { data: wfJobs } = await octokit.rest.actions.listJobsForWorkflowRun({
+        owner,
+        repo,
+        run_id: run.id,
+      });
+      // get the result job
+      const job = wfJobs.jobs.find((j) => j.name === 'result');
+      if (job) {
+        const step = job.steps.find((s) => s.name.startsWith('Result: '));
+        if (step) {
+          core.setOutput('result', step.name.replace('Result: ', ''));
+        }
+      } 
     } else {
       core.setFailed(`Workflow ${status} with ${conclusion}.`);
     }

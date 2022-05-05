@@ -21,13 +21,18 @@ jobs:
       - uses: actions/checkout@v2
 
       - name: Trigger workflow with dispatch event
+        id: main
         uses: ./trigger-workflow
         with:
           owner: nuxeo
           repo: ui-team-gh-actions
-          branch-name: main
+          branch-name: elements-pr-check
           access-token: ${{ secrets.ACCESS_TOKEN }}
           workflow-id: dispatch.yaml
           poll-interval: '1000'
           inputs: |
             string_parameter: 'Run triggered with workflow_dispatch event'
+
+      - name: Output workflow result
+        run: |
+          echo ${{ steps.main.outputs.result }}

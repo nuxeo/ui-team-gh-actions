@@ -28,3 +28,12 @@ jobs:
     steps:
       - name: Echo string parameter
         run: echo ${{ github.event.inputs.string_parameter }}
+  result:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      success: ${{ steps.result.outputs.result }}
+    steps:
+      - name: 'Result: The wf run was successful'
+        run: |
+          echo ::set-output name=result::'The wf run was successful'
