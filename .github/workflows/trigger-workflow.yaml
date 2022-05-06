@@ -20,14 +20,27 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
+      # This step will add an output named 'result'
       - name: Trigger workflow with dispatch event
+        id: main
         uses: ./trigger-workflow
         with:
           owner: nuxeo
           repo: ui-team-gh-actions
-          branch-name: main
+          branch-name: WEBUI-784-webui-elements-preview
           access-token: ${{ secrets.ACCESS_TOKEN }}
           workflow-id: dispatch.yaml
           poll-interval: '1000'
           inputs: |
             string_parameter: 'Run triggered with workflow_dispatch event'
+
+      # These steps print and assert the 'result' output from the 'id: main' step
+      - name: Output workflow result
+        run: |
+          echo ${{ steps.main.outputs.message }}
+
+      - name: Assert remote workflow result
+        if: ${{ github.event_name == 'pull_request' && steps.main.outputs.message != 'The wf run was successful' }}
+        run: |
+          echo 'The output should be "The wf run was successful", but was ${{ steps.main.outputs.message }}'
+          exit 1

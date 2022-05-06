@@ -23,6 +23,9 @@ inputs:
   inputs:
     description: 'Workflow inputs'
     required: false
+outputs:
+  message:
+    description: 'The output of the called action'
 runs:
   using: 'node16'
   main: 'index.js'
