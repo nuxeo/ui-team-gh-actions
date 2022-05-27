@@ -27,9 +27,9 @@ jobs:
         with:
           owner: nuxeo
           repo: ui-team-gh-actions
-          branch-name: WEBUI-784-webui-elements-preview
+          branch-name: main
           access-token: ${{ secrets.ACCESS_TOKEN }}
-          workflow-id: dispatch.yaml
+          workflow-id: dispatch-test.yaml
           poll-interval: '1000'
           inputs: |
             string_parameter: 'Run triggered with workflow_dispatch event'
