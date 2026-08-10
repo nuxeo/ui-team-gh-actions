@@ -41,28 +41,31 @@ async function getWorkflowRuns(owner, repo, workflowID) {
 async function getWorkflowRun(owner, repo, workflowID, srcWfRunID) {
   await sleep(10000);
 
-  let activeRun;
-  let i = 0;
-  // because the workflow run might have been delayed, we'll retry
+  // Because the dispatched run — or its identifying job — might be delayed, we rescan from
+  // scratch on each retry. `i` MUST be reset per retry: the identifying job is frequently not
+  // registered yet during the first pass, and a shared counter would leave `i` at runs.length,
+  // so the next retry read runs[runs.length] (undefined) and threw on `.id`.
   for (let retries = 3; retries > 0; retries--) {
-    let runs = await getWorkflowRuns(owner, repo, workflowID);
-    do {
+    const runs = await getWorkflowRuns(owner, repo, workflowID);
+    for (let i = 0; i < runs.length; i++) {
       await sleep(2000);
-      activeRun = runs[i++];
+      const activeRun = runs[i];
       let { data: wfJobs } = await octokit.rest.actions.listJobsForWorkflowRun({
         owner,
         repo,
         run_id: activeRun.id,
       });
-  
+
       // get the id job
       const job = wfJobs.jobs.find((j) => j.name === `${SETUP_WF_LABEL} ${srcWfRunID}`);
       if (job) {
         return activeRun;
       }
-    } while (runs.length > i);
+    }
   }
-  return activeRun;
+  // No run carrying our identifying job was found within the retry budget. Return undefined so
+  // the caller reports "No run was found" instead of waiting on an unrelated (last-scanned) run.
+  return undefined;
 }
 
 /**
