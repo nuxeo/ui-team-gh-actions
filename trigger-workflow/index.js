@@ -18,53 +18,57 @@ const github = require('@actions/github');
 
 let octokit;
 const SETUP_WF_LABEL = 'Remote Caller ID';
+// How long to keep polling for the dispatched run's identifying job before giving up, and how long
+// to wait between polls. Expressed as an explicit time budget (rather than derived from the number
+// of runs returned) so that narrowing the candidate list — e.g. adding `per_page` — cannot silently
+// shrink the window in which a late handshake is still tolerated.
+const DEFAULT_TIMEOUT_MS = 4 * 60 * 1000;
+const DEFAULT_POLL_MS = 5000;
 
 function sleep(milliseconds) {
   return new Promise((r) => setTimeout(r, milliseconds));
 }
 
 /**
- * Get the workflow runs for the provided workflow id.
+ * Get the workflow runs for the provided workflow id, optionally narrowed by server-side filters
+ * (e.g. event, branch, created).
  */
-async function getWorkflowRuns(owner, repo, workflowID) {
+async function getWorkflowRuns(owner, repo, workflowID, filters = {}) {
   const { data: runs } = await octokit.rest.actions.listWorkflowRuns({
     owner,
     repo,
     workflow_id: workflowID,
+    ...filters,
   });
   return runs.workflow_runs;
 }
 
 /**
  * Get the run that was triggered using the dispatch event.
+ *
+ * Polls until one of the candidate runs exposes our identifying `${SETUP_WF_LABEL} <id>` handshake
+ * job, or until the time budget is exhausted. The candidate list is rescanned from the top on every
+ * pass because the handshake job is frequently not registered yet on the first pass: a
+ * cancel-in-progress concurrency group on the callee delays job scheduling by ~25-41s, so it is
+ * usually a later pass that finds it. Returns undefined on timeout so the caller's `if (!run)`
+ * guard can fail the action cleanly.
  */
-async function getWorkflowRun(owner, repo, workflowID, srcWfRunID) {
-  await sleep(10000);
-
-  // Because the dispatched run — or its identifying job — might be delayed, we rescan from
-  // scratch on each retry. `i` MUST be reset per retry: the identifying job is frequently not
-  // registered yet during the first pass, and a shared counter would leave `i` at runs.length,
-  // so the next retry read runs[runs.length] (undefined) and threw on `.id`.
-  for (let retries = 3; retries > 0; retries--) {
-    const runs = await getWorkflowRuns(owner, repo, workflowID);
-    for (let i = 0; i < runs.length; i++) {
-      await sleep(2000);
-      const activeRun = runs[i];
-      let { data: wfJobs } = await octokit.rest.actions.listJobsForWorkflowRun({
+async function getWorkflowRun(owner, repo, workflowID, srcWfRunID, filters = {}) {
+  const deadline = Date.now() + DEFAULT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const runs = await getWorkflowRuns(owner, repo, workflowID, filters);
+    for (const activeRun of runs) {
+      const { data: wfJobs } = await octokit.rest.actions.listJobsForWorkflowRun({
         owner,
         repo,
         run_id: activeRun.id,
       });
-
-      // get the id job
-      const job = wfJobs.jobs.find((j) => j.name === `${SETUP_WF_LABEL} ${srcWfRunID}`);
-      if (job) {
+      if (wfJobs.jobs.some((j) => j.name === `${SETUP_WF_LABEL} ${srcWfRunID}`)) {
         return activeRun;
       }
     }
+    await sleep(DEFAULT_POLL_MS);
   }
-  // No run carrying our identifying job was found within the retry budget. Return undefined so
-  // the caller reports "No run was found" instead of waiting on an unrelated (last-scanned) run.
   return undefined;
 }
 
@@ -129,11 +133,19 @@ async function run() {
       inputs[exprs[0].trim()] = `${exprs[1].trim()}`;
     });
 
+    // Narrow the candidate runs to the ones this dispatch could have created: same event and
+    // branch, created no earlier than just before we dispatched (a 30s buffer absorbs client/server
+    // clock skew). Deliberately NOT filtering on status: a run held back by the callee's
+    // concurrency group is `queued`, which is exactly the delayed-handshake case this polling
+    // exists to handle.
+    const since = new Date(Date.now() - 30 * 1000).toISOString();
+
     // trigger the remote workflow using the dispatch event
     await dispatchWorkflowRun(owner, repo, workflowID, branchName, inputs);
 
     // get the run we just created using the dispatch event
-    let run = await getWorkflowRun(owner, repo, workflowID, srcWfRunID);
+    const filters = { event: 'workflow_dispatch', branch: branchName, created: `>=${since}` };
+    const run = await getWorkflowRun(owner, repo, workflowID, srcWfRunID, filters);
     if (!run) {
       core.setFailed(`No run was found for id ${context.runId}`);
       return;
@@ -149,7 +161,7 @@ async function run() {
       core.info(`Workflow ${status} with ${conclusion}`);
 
       // get the output of the run if any is available
-      let { data: wfJobs } = await octokit.rest.actions.listJobsForWorkflowRun({
+      const { data: wfJobs } = await octokit.rest.actions.listJobsForWorkflowRun({
         owner,
         repo,
         run_id: run.id,
