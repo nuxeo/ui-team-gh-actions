@@ -116,12 +116,21 @@ export function extendComment({ group, added, evidence, runId, marker }) {
   ]);
 }
 
+function priorityLine(priority) {
+  if (!priority) {
+    return '';
+  }
+  return priority.from
+    ? ` Priority raised from ${priority.from} to ${priority.to}.`
+    : ` Priority set to ${priority.to}.`;
+}
+
 export function severityComment({ raise, runId, marker }) {
   const from = raise.from ? titleCase(raise.from) : 'unset';
   const text =
     `GitHub now reports ${titleCase(raise.to)} for ${raise.alerts.join(', ')}. ` +
     `Defect Severity raised from ${from} to ${titleCase(raise.to)}.` +
-    (raise.priority ? ` Priority raised from ${raise.priority.from ?? 'unset'} to ${raise.priority.to}.` : '') +
+    priorityLine(raise.priority) +
     ` Run ${runId} (ref ${marker}).`;
   return adfDoc([adfHeading('Dependabot triage: severity raised'), adfParagraph(adfText(text))]);
 }

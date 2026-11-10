@@ -249,6 +249,10 @@ function checkScopeChange(ctx, group, owned, where) {
   for (const [id] of retained.filter(([candidate]) => !listed.has(candidate))) {
     ctx.fail('ownership-dropped', `${where} omits ${id}, which ${ticket} already owns.`);
   }
+  // A ticket is only changed for alerts the planner was asked about; covered alerts alone never justify a write.
+  if (!owned.some((alert) => ctx.aiInput.has(alertId(repository, alert.number)))) {
+    ctx.fail('group-schema', `${where} names no alert given to the planner for ${ticket}.`);
+  }
   const added = owned.filter((alert) => !ctx.currentOwner.has(alertId(repository, alert.number)));
   if ((operation === 'extend' || operation === 'adopt') && added.length === 0) {
     ctx.fail('group-schema', `${where} ${operation}s ${ticket} without adding any unowned alert.`);

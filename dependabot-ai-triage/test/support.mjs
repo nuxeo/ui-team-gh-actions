@@ -75,6 +75,9 @@ export class FakeJira {
 
   async issue(key, fields, properties = []) {
     const issue = this.issues.get(key);
+    if (!issue) {
+      throw Object.assign(new Error(`Jira GET issue read: HTTP 404`), { status: 404 });
+    }
     return {
       key,
       fields: issue.fields,
@@ -156,6 +159,12 @@ export class FakeJira {
 
   async link(type, inward, outward) {
     this.record('link', { type, inward, outward });
+    const from = this.issues.get(inward).fields;
+    const to = this.issues.get(outward)?.fields;
+    from.issuelinks = [...(from.issuelinks ?? []), { outwardIssue: { key: outward } }];
+    if (to) {
+      to.issuelinks = [...(to.issuelinks ?? []), { inwardIssue: { key: inward } }];
+    }
   }
 }
 

@@ -4,13 +4,14 @@ import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { Executor, actionMarker, apply, postTeams, runPending, summarize } from '../apply.mjs';
+import { Executor, commentMarker, apply, postTeams, runPending, severityMarker, summarize } from '../apply.mjs';
 import {
   branchEvidence,
   clearedAlerts,
   collect,
   npmSummary,
   plannerTicket,
+  readTickets,
   selectCandidates,
   ticketQueries,
 } from '../collect.mjs';
@@ -1186,11 +1187,11 @@ test('uncertain scope writes from earlier runs are reconciled from comments befo
     ['old:a', 'APP-31'],
     ['old:b', 'APP-28'],
   ]) {
-    const recovery = { key, markers: [actionMarker(id, 'scope')] };
+    const recovery = { key, markers: [commentMarker(id, 'scope')] };
     await control.reserve({ id, kind: 'extend', target: key, runId: 'old', recovery });
     await control.settle(id, 'uncertain', {});
   }
-  const text = `Run old (ref ${actionMarker('old:a', 'scope')}).`;
+  const text = `Run old (ref ${commentMarker('old:a', 'scope')}).`;
   jira.issues.get('APP-31').comments.push({ type: 'doc', content: [{ type: 'text', text }] });
   const { exec } = await executor(jira, tickets);
   await exec.recover();
@@ -1368,7 +1369,7 @@ test('recovery reads the whole comment history, not only the latest page', async
   const tickets = registerTickets();
   const jira = new FakeJira(tickets);
   jira.recentComments = async () => [];
-  const marker = actionMarker('old:x', 'scope');
+  const marker = commentMarker('old:x', 'scope');
   jira.allComments = async () => [{ body: { type: 'doc', content: [{ type: 'text', text: `ref ${marker}` }] } }];
   const control = new ControlState(jira, config.controlIssue);
   await control.load();
@@ -1390,9 +1391,9 @@ test('scope recovery requires the comment of that exact action, not any comment 
   await control.load();
   const earlier = 'run-1:APP-31:extend:aaa';
   const later = 'run-1:APP-31:extend:bbb';
-  const text = `Run run-1 (ref ${actionMarker(earlier, 'scope')}).`;
+  const text = `Run run-1 (ref ${commentMarker(earlier, 'scope')}).`;
   jira.issues.get('APP-31').comments.push({ type: 'doc', content: [{ type: 'text', text }] });
-  const recovery = { key: 'APP-31', markers: [actionMarker(later, 'scope'), actionMarker(later, 'severity')] };
+  const recovery = { key: 'APP-31', markers: [commentMarker(later, 'scope'), commentMarker(later, 'severity')] };
   await control.reserve({ id: later, kind: 'extend', target: 'APP-31', runId: 'run-1', recovery });
   await control.settle(later, 'uncertain', {});
   const { exec } = await executor(jira, tickets);
@@ -1490,6 +1491,8 @@ test('a confirmed severity raise from an interrupted run still gets its explaini
   const tickets = registerTickets();
   const jira = new FakeJira(tickets);
   jira.issues.get('LIB-44').fields[config.severityField] = { id: severityId('critical') };
+  // A scope step adds the owned label before raising the severity.
+  jira.issues.get('LIB-44').fields.labels.push(OWNED_LABEL);
   const control = new ControlState(jira, config.controlIssue);
   await control.load();
   const id = 'old:LIB-44:extend:sig';
@@ -1508,7 +1511,7 @@ test('a confirmed severity raise from an interrupted run still gets its explaini
     { id: `${id}:severity-comment`, kind: 'severity-comment', key: 'LIB-44', raise },
   ]);
   assert.deepEqual(await exec.replayPending(exec.pendingWrites), []);
-  const marker = actionMarker(`${id}:severity-comment`, 'severity');
+  const marker = severityMarker(`${id}:severity-comment`);
   assert.ok(jira.issues.get('LIB-44').comments.some((comment) => JSON.stringify(comment).includes(marker)));
 });
 
@@ -1890,4 +1893,265 @@ test('links of a created ticket and the explanation of a raise are queued when t
     { id: 'old:LIB-3000:link:LIB-44', from: 'LIB-3000', to: 'LIB-44' },
     { id: 'old:r:extend:s:severity-comment', kind: 'severity-comment', key: 'LIB-44', raise },
   ]);
+});
+
+// Combined local review before the next push.
+
+test('an unreadable upstream ticket is a collection warning, not a failure of every later run', async () => {
+  const warnings = [];
+  const owner = { blocker: { type: 'upstream-release-pending', upstreamRef: 'NXP-404' } };
+  const jira = {
+    async search() {
+      return [{ key: 'APP-1', fields: { status: { name: 'On Hold' } }, properties: { [OWNERSHIP_PROPERTY]: owner } }];
+    },
+    async issue(key) {
+      throw Object.assign(new Error(`Jira GET issue read: HTTP 404 (${key})`), { status: 404 });
+    },
+  };
+  await readTickets(jira, config, [], warnings);
+  assert.match(warnings.join(), /NXP-404 .*cannot be read/);
+});
+
+test('a blocker naming an unreadable Jira ticket is not recorded', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const { exec, outcome } = await executor(jira, tickets);
+  const report = {};
+  await exec.create(
+    group(`${EL}:typo`, EL, 'create', undefined, 'medium', [108], { ...blocked('upstream-release-pending', 'NXP-1') }),
+    report,
+  );
+  assert.equal(report.ticketKey, undefined);
+  assert.match(outcome.failures.join(), /NXP-1 cannot be read/);
+  assert.equal(jira.calls.filter((call) => call.name === 'create').length, 0);
+});
+
+test('a keep group must name at least one alert given to the planner', () => {
+  const alerts = liveAlerts();
+  const plan = bootstrapPlan();
+  plan.groups = [group(`${WEB}:app-31`, WEB, 'keep', 'APP-31', 'medium', [14, 15, 16], { updateNote: 'x' })];
+  const result = validatePlan({
+    plan,
+    runId: RUN,
+    inventoryDigest: DIGEST,
+    repositories: [
+      { name: WEB, project: 'APP' },
+      { name: EL, project: 'LIB' },
+    ],
+    epicQuarter: '2026-Q4',
+    alerts,
+    aiInput: [`${WEB}#2`],
+    currentOwner: new Map([14, 15, 16].map((number) => [`${WEB}#${number}`, 'APP-31'])),
+    tickets: registerTickets(),
+    now: new Date('2026-11-09T07:45:00Z'),
+  });
+  assert.ok(result.errors.some((error) => /names no alert given to the planner/.test(error.message)));
+});
+
+test('a related ticket updated by a link of this run does not block a later create', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const { exec } = await executor(jira, tickets);
+  await exec.link('LIB-44', 'LIB-24');
+  assert.ok(exec.touched.has('LIB-24'));
+});
+
+test('a recovered covered raise is explained with its exact priority change', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  jira.issues.get('APP-31').fields.priority = { name: 'Low' };
+  jira.failNext = { name: 'edit', error: { uncertain: true } };
+  const { exec, control } = await executor(jira, tickets);
+  exec.config = {
+    ...config,
+    priorityBySeverity: { critical: 'High', high: 'High', medium: 'Medium', low: 'Low' },
+    priorityOrder: ['Lowest', 'Low', 'Medium', 'High', 'Highest'],
+  };
+  await exec.raiseCovered({ ticket: 'APP-31', from: 'medium', to: 'high', alerts: [`${WEB}#14`] }, new Set());
+  const entry = control.journal.entries.find((item) => item.kind === 'severity');
+  assert.deepEqual(entry.recovery.raise.priority, { from: 'Low', to: 'High' });
+  assert.equal(entry.recovery.raise.from, 'medium');
+});
+
+test('old Teams records of any outcome are pruned with their stored card', async () => {
+  const jira = new FakeJira();
+  const control = new ControlState(jira, 'APP-99');
+  await control.load();
+  const old = new Date(Date.now() - 40 * 864e5).toISOString();
+  await control.storeCard('old-run', { type: 'message' });
+  control.journal.entries.push({ id: 'old-run:teams', kind: 'teams', runId: 'old-run', status: 'uncertain', at: old });
+  for (let i = 0; i < 80; i++) {
+    control.journal.entries.push({ id: `d-${i}`, kind: 'ownership', status: 'done', detail: 'x'.repeat(400) });
+  }
+  await control.persistJournal();
+  assert.equal(control.has('old-run:teams'), false);
+  assert.equal(await control.storedCard('old-run'), null);
+});
+
+test('scope recovery is not complete while the owned label is missing, even if the severity was raised by hand', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  jira.issues.get('LIB-44').fields[config.severityField] = { id: severityId('critical') };
+  jira.issues.get('LIB-44').fields.labels = jira.issues.get('LIB-44').fields.labels.filter((l) => l !== OWNED_LABEL);
+  const control = new ControlState(jira, config.controlIssue);
+  await control.load();
+  const id = 'old:LIB-44:adopt:sig';
+  const recovery = { key: 'LIB-44', raiseTo: 'critical', raise: { from: 'high', to: 'critical', alerts: [] } };
+  await control.reserve({ id, kind: 'adopt', target: 'LIB-44', runId: 'old', recovery });
+  await control.settle(id, 'uncertain', {});
+  const { exec } = await executor(jira, tickets);
+  await exec.recover();
+  const reloaded = new ControlState(jira, config.controlIssue);
+  await reloaded.load();
+  assert.equal(reloaded.find(id).status, 'not-applied');
+  assert.deepEqual(exec.pendingWrites, []);
+});
+
+test('a completed create is not pruned before the links it owes are reserved', async () => {
+  const jira = new FakeJira();
+  const control = new ControlState(jira, 'APP-99');
+  await control.load();
+  const create = {
+    id: 'run:x:create',
+    kind: 'create',
+    runId: 'run',
+    status: 'done',
+    recovery: { label: 'dat-x', links: ['LIB-44'] },
+    result: { key: 'LIB-3000' },
+  };
+  control.journal.entries.push(create);
+  for (let i = 0; i < 80; i++) {
+    control.journal.entries.push({ id: `d-${i}`, kind: 'ownership', status: 'done', detail: 'x'.repeat(400) });
+  }
+  await control.persistJournal();
+  assert.equal(control.has('run:x:create'), true);
+  control.journal.entries.push({ id: 'run:LIB-3000:link:LIB-44', kind: 'link', status: 'done' });
+  assert.equal(control.prunable(create), true);
+});
+
+test('a created ticket whose verification read fails is an unknown outcome, recovered by its label', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const issue = jira.issue.bind(jira);
+  jira.issue = async (key, fields, properties) => {
+    if (/^LIB-3/.test(key) && fields?.includes('parent')) {
+      throw new Error('HTTP 503');
+    }
+    return issue(key, fields, properties);
+  };
+  const { exec, control } = await executor(jira, tickets);
+  await exec.create(createGroup(), {});
+  assert.equal(control.journal.entries.find((item) => item.kind === 'create').status, 'uncertain');
+});
+
+test('an updated On Hold reason is posted even when the blocker type and reference are unchanged', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const ownership = { kind: 'blocked', blocker: { type: 'upstream-release-pending', upstreamRef: 'LIB-24' } };
+  const first = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-45', 'low', [106], {
+    ...blocked('upstream-release-pending', 'LIB-24'),
+  });
+  const updated = structuredClone(first);
+  updated.blocker.reason = 'The Elements release slipped to the next quarter.';
+  const report = { blockerChanged: true };
+  await (await executor(jira, tickets)).exec.holdWithReason(first, { key: 'LIB-45', onHold: true, ownership }, report);
+  await (
+    await executor(jira, tickets, { runId: 'week-5' })
+  ).exec.holdWithReason(updated, { key: 'LIB-45', onHold: true, ownership }, { blockerChanged: true });
+  const texts = jira.issues.get('LIB-45').comments.map((comment) => JSON.stringify(comment));
+  assert.equal(texts.filter((text) => text.includes('Reason for On Hold')).length, 2);
+  assert.ok(texts.some((text) => text.includes('slipped to the next quarter')));
+});
+
+test('a severity raised again after a manual reset is explained again', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const raise = () => {
+    return { ticket: 'APP-31', from: 'medium', to: 'high', alerts: [`${WEB}#14`] };
+  };
+  await (await executor(jira, tickets)).exec.raiseCovered(raise(), new Set());
+  jira.issues.get('APP-31').fields[config.severityField] = { id: severityId('medium') };
+  await (await executor(jira, tickets, { runId: 'week-2' })).exec.raiseCovered(raise(), new Set());
+  const texts = jira.issues.get('APP-31').comments.map((comment) => JSON.stringify(comment));
+  assert.equal(texts.filter((text) => text.includes('severity raised')).length, 2);
+});
+
+test('a recovered raise still owes its explanation when the run stops before writing it', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  jira.issues.get('LIB-44').fields[config.severityField] = { id: severityId('high') };
+  jira.issues.get('LIB-44').fields.labels.push(OWNED_LABEL);
+  const control = new ControlState(jira, config.controlIssue);
+  await control.load();
+  const id = 'old:LIB-44:adopt:sig';
+  const raise = { from: 'medium', to: 'high', alerts: ['#107'] };
+  await control.reserve({
+    id,
+    kind: 'adopt',
+    target: 'LIB-44',
+    runId: 'old',
+    recovery: { key: 'LIB-44', raiseTo: 'high', raise },
+  });
+  await control.settle(id, 'uncertain', {});
+  // This run recovers the raise, then stops before the explanation is reserved or the queue is saved.
+  await (await executor(jira, tickets, { runId: 'stopped' })).exec.recover();
+  const next = await executor(jira, tickets, { runId: 'next-run' });
+  await next.exec.recover();
+  assert.deepEqual(next.exec.pendingWrites, [
+    { id: `${id}:severity-comment`, kind: 'severity-comment', key: 'LIB-44', raise },
+  ]);
+});
+
+test('a follow-up that keeps timing out is given up after its attempts, across recoveries', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  jira.issues.set('LIB-700', { key: 'LIB-700', fields: { labels: [], issuelinks: [] }, properties: {}, comments: [] });
+  jira.link = async () => {
+    throw Object.assign(new Error('Jira POST link: HTTP 504'), { status: 504, uncertain: true });
+  };
+  const control = new ControlState(jira, config.controlIssue);
+  await control.load();
+  const id = 'old:LIB-700:link:LIB-44';
+  await control.reserve({ id, kind: 'link', target: 'x', runId: 'old', recovery: { from: 'LIB-700', to: 'LIB-44' } });
+  await control.settle(id, 'failed', { message: 'HTTP 503', attempts: 1 });
+  let warnings = [];
+  for (let run = 0; run < 8 && !warnings.length; run += 1) {
+    const { exec, control: state, outcome } = await executor(jira, tickets, { runId: `run-${run}` });
+    outcome.groups = [];
+    await exec.recover();
+    await runPending(exec, state, outcome, null);
+    warnings = outcome.warnings.filter((warning) => warning.code === 'abandoned');
+  }
+  assert.equal(warnings.length, 1);
+});
+
+test('a recovered ticket whose fields Jira did not keep is reported', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const { key } = await jira.create({ project: { key: 'LIB' }, labels: ['dat-x'], parent: { key: 'OTHER-1' } });
+  jira.issues.get(key).fields[config.severityField] = { id: severityId('low') };
+  const control = new ControlState(jira, config.controlIssue);
+  await control.load();
+  const recovery = { label: 'dat-x', links: [], severity: 'medium', epic: 'EPIC-1' };
+  await control.reserve({ id: 'old:x:create', kind: 'create', target: 'x', runId: 'old', recovery });
+  const { exec, outcome } = await executor(jira, tickets);
+  await exec.recover();
+  assert.ok(outcome.warnings.some((warning) => warning.code === 'created-mismatch'));
+});
+
+test('a covered raise is not written when the ticket changes between its two reads', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const issue = jira.issue.bind(jira);
+  let reads = 0;
+  jira.issue = async (key, fields, properties) => {
+    if (key === 'APP-31' && properties?.length && ++reads === 2) {
+      jira.issues.get('APP-31').fields.priority = { name: 'Highest' };
+    }
+    return issue(key, fields, properties);
+  };
+  const { exec, outcome } = await executor(jira, tickets);
+  await exec.raiseCovered({ ticket: 'APP-31', from: 'medium', to: 'high', alerts: [`${WEB}#14`] }, new Set());
+  assert.equal(jira.calls.filter((call) => call.name === 'edit').length, 0);
+  assert.match(outcome.failures.join(), /changed while this run was writing/);
 });

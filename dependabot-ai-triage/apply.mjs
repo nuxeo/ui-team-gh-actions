@@ -14,7 +14,7 @@ import {
   teamsCard,
   ticketDescription,
 } from './lib/render.mjs';
-import { ControlState } from './lib/state.mjs';
+import { ControlState, RETRIED, followUps, retryItem } from './lib/state.mjs';
 import {
   SEVERITY_RANK,
   adfDoc,
@@ -31,15 +31,35 @@ import {
 
 const readJson = (file) => JSON.parse(readFileSync(file, 'utf8'));
 const RETRYABLE = new Set(['failed', 'not-applied']);
+// A follow-up write is given up after this many failed attempts, or at once on a permanent client error.
+const MAX_ATTEMPTS = 5;
+const permanentFailure = (status) => status >= 400 && status < 500 && status !== 408 && status !== 429;
 
 export function quarterLabel(quarter) {
   return quarter.replace('-', '_');
 }
 
-/** Identifies one comment of one journalled action, so recovery never mistakes another comment for it. */
-export function actionMarker(id, step) {
-  return `dat-${shortHash([id, step])}`;
+/**
+ * Names what a comment says about which ticket, never which run wrote it: recovery proves a write by its marker,
+ * and a later run that would post the same comment finds it and does not repeat it.
+ */
+export function commentMarker(...parts) {
+  return `dat-${shortHash(parts)}`;
 }
+
+// A blocker reason is identified by everything it says, so an updated reason, mitigation or recheck is posted.
+export const holdMarker = (key, blocker) =>
+  commentMarker(
+    'hold',
+    key,
+    blocker?.type,
+    blocker?.upstreamRef ?? null,
+    blocker?.reason,
+    blocker?.mitigation,
+    blocker?.recheck,
+  );
+// A raise happens once, so its explanation is identified by the step that made it: every raise is explained.
+export const severityMarker = (commentId) => commentMarker('severity', commentId);
 
 export function ownershipRecord({ group, alerts, previous, runId, now, upstreamStatus = null }) {
   const records = { ...previous?.alerts };
@@ -193,12 +213,13 @@ export class Executor {
 
   async recordFailure(id, kind, target, error) {
     const status = error.uncertain ? 'uncertain' : 'failed';
+    const attempts = (this.control.find(id)?.result?.attempts ?? 0) + 1;
     this.outcome.actions.push({ status, kind, target, detail: error.message });
     this.outcome.failures.push(`${kind} ${target}: ${error.message}`);
     // An unknown remote outcome is reconciled on the next run instead of continuing blindly.
     this.stopped = Boolean(error.uncertain);
     try {
-      await this.control.settle(id, status, { message: error.message });
+      await this.control.settle(id, status, { message: error.message, httpStatus: error.status ?? null, attempts });
     } catch (journalError) {
       this.stopped = true;
       this.outcome.failures.push(`${kind} ${target}: journal entry not saved: ${journalError.message}`);
@@ -248,6 +269,15 @@ export class Executor {
     const problems = checks.filter(([, failed]) => failed).map(([name]) => name);
     if (problems.length) {
       throw new Error(`${key} verification failed: ${problems.join(', ')}`);
+    }
+  }
+
+  /** Verifies a write that was sent: a failed check is an unknown outcome, reconciled from Jira by the next run. */
+  async verifyWritten(key, expected) {
+    try {
+      await this.verifyIssue(key, expected);
+    } catch (error) {
+      throw Object.assign(error, { uncertain: true });
     }
   }
 
@@ -309,12 +339,7 @@ export class Executor {
     };
     if (Object.keys(fields).length) {
       await this.jira.edit(key, fields);
-      try {
-        await this.verifyIssue(key, { severity, priority });
-      } catch (error) {
-        // The edit was sent: an unverified outcome is reconciled from Jira by the next run, never assumed failed.
-        throw Object.assign(error, { uncertain: true });
-      }
+      await this.verifyWritten(key, { severity, priority });
     }
   }
 
@@ -343,7 +368,7 @@ export class Executor {
       throw new Error(`${key} has no transition to "${this.config.holdStatus}"`);
     }
     await this.jira.transition(key, transition.id);
-    await this.verifyIssue(key, { status: this.config.holdStatus });
+    await this.verifyWritten(key, { status: this.config.holdStatus });
     return true;
   }
 
@@ -357,11 +382,12 @@ export class Executor {
     const { runId } = this.inventory;
     const holdNow = !target.onHold;
     if (holdNow) {
+      // The blocker travels with the reservation, so a reason a stopped run never posted is still posted later.
       const hold = this.withRecovery(
         async () => {
           return { key: target.key, held: await this.hold(target.key, group) };
         },
-        { key: target.key },
+        { key: target.key, blocker: group.blocker },
       );
       const held = await this.act(`${runId}:${target.key}:hold`, 'hold', target.key, hold);
       report.heldVerified = Boolean(held?.held);
@@ -373,21 +399,28 @@ export class Executor {
     const blockerMoved = recorded?.type !== group.blocker?.type || recorded?.upstreamRef !== group.blocker?.upstreamRef;
     if (holdNow || target.ownership?.kind !== 'blocked' || blockerMoved || report.blockerChanged) {
       const id = `${runId}:${target.key}:hold-comment`;
-      const marker = actionMarker(id, 'reason');
-      const reason = this.withRecovery(
-        async () => {
-          await this.commentOnce(target.key, marker, holdComment({ group, runId, marker }));
-          return { key: target.key };
-        },
-        { key: target.key, markers: [marker] },
-      );
-      if (!(await this.act(id, 'hold-comment', target.key, reason))) {
+      if (!(await this.act(id, 'hold-comment', target.key, this.holdCommentAction(target.key, group.blocker)))) {
+        if (this.control.find(id)?.status === 'failed') {
+          this.pendingWrites.push({ id, kind: 'hold-comment', key: target.key, blocker: group.blocker });
+        }
         return false;
       }
     }
     report.onHold = true;
     report.blockerChanged = report.blockerChanged || Boolean(report.heldVerified);
     return true;
+  }
+
+  /** The "Reason for On Hold" comment for a blocker. */
+  holdCommentAction(key, blocker) {
+    const marker = holdMarker(key, blocker);
+    return this.withRecovery(
+      async () => {
+        await this.commentOnce(key, marker, holdComment({ group: { blocker }, runId: this.inventory.runId, marker }));
+        return { key };
+      },
+      { key, blocker, markers: [marker] },
+    );
   }
 
   /**
@@ -425,7 +458,7 @@ export class Executor {
       this.withRecovery(
         async () => {
           await this.jira.setProperty(target.key, OWNERSHIP_PROPERTY, ownership);
-          await this.verifyIssue(target.key, { property: ownership });
+          await this.verifyWritten(target.key, { property: ownership });
           return { key: target.key };
         },
         { key: target.key },
@@ -465,8 +498,30 @@ export class Executor {
     };
   }
 
+  /** A Jira upstream reference must be a ticket this run can read; it is stored and re-read every week. */
+  async upstreamProblem(group) {
+    const ref = group.kind === 'blocked' ? group.blocker?.upstreamRef : null;
+    if (!ref || !JIRA_KEY.test(ref) || this.tickets.has(ref)) {
+      return null;
+    }
+    try {
+      await this.jira.issue(ref, ['status']);
+      return null;
+    } catch (error) {
+      if (![400, 403, 404].includes(error.status)) {
+        throw error;
+      }
+      return `upstream ticket ${ref} cannot be read (HTTP ${error.status}); not recorded as a blocker`;
+    }
+  }
+
   async create(group, report) {
     const { runId } = this.inventory;
+    const upstream = await this.upstreamProblem(group);
+    if (upstream) {
+      this.outcome.failures.push(`create ${group.remediationId}: ${upstream}.`);
+      return;
+    }
     // Scoped to this run: only a retry of this run (or recovery of its reservation) can find the ticket again,
     // never a ticket created for the same remediation in an earlier quarter.
     const runKey = shortHash([runId, group.remediationId]);
@@ -478,11 +533,11 @@ export class Executor {
         await this.checkLiveCoverage(group, alerts);
       }
       const key = existing[0]?.key ?? (await this.jira.create(this.createFields(group, alerts, label))).key;
-      await this.verifyIssue(key, { severity: group.severity, epic: this.config.epic });
+      await this.verifyWritten(key, { severity: group.severity, epic: this.config.epic });
       return { key, detail: existing.length ? '(reused the ticket from an interrupted attempt of this run)' : '' };
     };
     // The related tickets travel with the reservation, so links a stopped run never made are still made later.
-    run.recovery = { label, links: group.relatedTickets ?? [] };
+    run.recovery = { label, links: group.relatedTickets ?? [], severity: group.severity, epic: this.config.epic };
     const signature = this.signature(group);
     const id = `${runId}:${group.remediationId}:create`;
     const result = await this.act(id, 'create', group.remediationId, run, signature);
@@ -561,6 +616,8 @@ export class Executor {
       if (!(await this.linked(from, to))) {
         await this.jira.link(this.config.linkType, from, to);
       }
+      // A link updates both tickets: neither counts as changed by someone else in this run's live checks.
+      this.touched.add(to);
       return { key: from };
     };
     run.recovery = { from, to };
@@ -580,26 +637,62 @@ export class Executor {
     return Boolean(linked);
   }
 
-  /** Retries links and severity comments that definitely failed or were confirmed missing, under their own ids. */
+  async abandon(id, kind, target, result) {
+    await this.control.settle(id, 'abandoned', result);
+    const reason = result.message ?? `${result.attempts} failed attempts`;
+    const message = `${kind} ${target} could not be written (${reason}); given up, add it by hand.`;
+    this.outcome.warnings.push({ code: 'abandoned', message });
+  }
+
+  replayAction(item) {
+    if (item.kind === 'severity-comment') {
+      return this.severityCommentAction(item.id, item.key, item.raise);
+    }
+    if (item.kind === 'hold-comment') {
+      return this.holdCommentAction(item.key, item.blocker);
+    }
+    return this.linkAction(item.from, item.to);
+  }
+
+  /**
+   * Retries follow-up writes that definitely failed or were confirmed missing, under their own ids. One that fails
+   * permanently (a client error other than timeout or rate limit) or too often is abandoned and reported once.
+   */
   async replayPending(pending) {
     const remaining = [];
     await mapSequential(pending, async (item) => {
-      const comment = item.kind === 'severity-comment';
       const id = item.id ?? `${this.inventory.runId}:${item.from}:link:${item.to}`;
-      const done = comment
-        ? await this.act(id, item.kind, item.key, this.severityCommentAction(id, item.key, item.raise))
-        : await this.act(id, 'link', `${item.from} → ${item.to}`, this.linkAction(item.from, item.to));
+      const previous = this.control.find(id);
+      if (previous?.status === 'abandoned') {
+        return;
+      }
+      const kind = item.kind ?? 'link';
+      const target = kind === 'link' ? `${item.from} → ${item.to}` : item.key;
+      // Unknown outcomes count too: a write that keeps timing out is given up like one that keeps failing.
+      if (previous && previous.status !== 'done' && (previous.result?.attempts ?? 0) >= MAX_ATTEMPTS) {
+        await this.abandon(id, kind, target, previous.result);
+        return;
+      }
+      if (await this.act(id, kind, target, this.replayAction(item))) {
+        return;
+      }
+      const entry = this.control.find(id);
+      const result = entry?.result ?? {};
+      if (entry?.status === 'failed' && (permanentFailure(result.httpStatus) || result.attempts >= MAX_ATTEMPTS)) {
+        await this.abandon(id, kind, target, result);
+        return;
+      }
       // Kept until its journal entry is done: a write skipped because an earlier one stopped the run stays queued.
-      if (!done && this.control.find(id)?.status !== 'done') {
+      if (entry?.status !== 'done') {
         remaining.push({ ...item, id });
       }
     });
     return remaining;
   }
 
-  /** The "severity raised" comment of a severity change journalled as `id`; its marker comes from that id. */
-  severityCommentAction(id, key, raise) {
-    const marker = actionMarker(id, 'severity');
+  /** The "severity raised" comment of a severity change. */
+  severityCommentAction(commentId, key, raise) {
+    const marker = severityMarker(commentId);
     return this.withRecovery(
       async () => {
         await this.commentOnce(key, marker, severityComment({ raise, runId: this.inventory.runId, marker }));
@@ -652,7 +745,8 @@ export class Executor {
     const explained = !scope.raise || (await this.explainRaise(id, target.key, scope.raise));
     if (group.operation === 'extend' || group.updateNote) {
       const noteId = `${id}:scope-comment`;
-      const marker = actionMarker(noteId, 'scope');
+      const numbers = added.map((alert) => alert.number).sort((a, b) => a - b);
+      const marker = commentMarker('scope', target.key, group.remediationId, numbers, group.updateNote ?? null);
       const note = this.withRecovery(
         async () => {
           await this.commentOnce(target.key, marker, extendComment({ group, added, evidence, runId, marker }));
@@ -675,6 +769,11 @@ export class Executor {
       target = await this.refreshTarget(group);
     } catch (error) {
       this.outcome.failures.push(`${group.operation} ${group.ticket}: ${error.message}`);
+      return;
+    }
+    const upstream = await this.upstreamProblem(group);
+    if (upstream) {
+      this.outcome.failures.push(`${group.operation} ${group.ticket}: ${upstream}.`);
       return;
     }
     const recorded = new Set(Object.keys(target.ownership?.alerts ?? {}).map(Number));
@@ -725,6 +824,22 @@ export class Executor {
       return;
     }
     const id = `${this.inventory.runId}:${raise.ticket}:severity-${raise.to}`;
+    // Read first, so recovery can explain exactly what this step changes; the step itself re-reads before writing.
+    let before;
+    try {
+      before = await this.refreshTarget({ ticket: raise.ticket, operation: 'raise', kind: 'actionable' });
+    } catch (error) {
+      this.outcome.failures.push(`severity ${raise.ticket}: ${error.message}`);
+      raise.applied = false;
+      return;
+    }
+    const plannedPriority = this.priorityRaise(raise.to, before.priority);
+    const plannedRaise = {
+      from: before.severity ?? null,
+      to: raise.to,
+      alerts: raise.alerts,
+      ...(plannedPriority ? { priority: { from: before.priority, to: plannedPriority } } : {}),
+    };
     const result = await this.act(
       id,
       'severity',
@@ -738,6 +853,10 @@ export class Executor {
             operation: 'raise',
             kind: 'actionable',
           });
+          // Recovery explains exactly the change recorded before this step; a ticket edited since is left alone.
+          if (severity !== before.severity || priority !== before.priority) {
+            throw new Error(`${raise.ticket} changed while this run was writing; re-planned next run`);
+          }
           const raised = SEVERITY_RANK[raise.to] > (SEVERITY_RANK[severity] ?? 0);
           const priorityTo = this.priorityRaise(raise.to, priority);
           await this.raiseFields(raise.ticket, raised ? raise.to : null, priorityTo);
@@ -750,12 +869,7 @@ export class Executor {
             raise: { from: severity ?? null, to: raise.to, alerts: raise.alerts, ...priorityChange },
           };
         },
-        {
-          key: raise.ticket,
-          raiseTo: raise.to,
-          priorityTo: this.config.priorityBySeverity?.[raise.to] ?? null,
-          raise: { from: raise.from ?? null, to: raise.to, alerts: raise.alerts },
-        },
+        { key: raise.ticket, raiseTo: raise.to, priorityTo: plannedPriority, raise: plannedRaise },
       ),
     );
     raise.applied = Boolean(result) && !result.unchanged;
@@ -785,12 +899,25 @@ export class Executor {
     }
   }
 
+  async reconcileCreate(recovery) {
+    const found = await this.jira.search(`labels = "${recovery.label}" ORDER BY created ASC`, ['summary']);
+    if (!found.length) {
+      return { status: 'not-applied' };
+    }
+    // The label proves which ticket it is, not that Jira kept every field: a mismatch is reported for a human.
+    try {
+      await this.verifyIssue(found[0].key, { severity: recovery.severity, epic: recovery.epic });
+    } catch (error) {
+      this.outcome.warnings.push({ code: 'created-mismatch', message: `${error.message}; check the ticket.` });
+    }
+    return { status: 'done', key: found[0].key };
+  }
+
   /** Decides from Jira whether an interrupted or uncertain write happened; never repeats it to find out. */
   async reconcileEntry(entry) {
     const { recovery } = entry;
     if (entry.kind === 'create') {
-      const found = await this.jira.search(`labels = "${recovery.label}" ORDER BY created ASC`, ['summary']);
-      return found.length ? { status: 'done', key: found[0].key } : { status: 'not-applied' };
+      return this.reconcileCreate(recovery);
     }
     if (entry.kind === 'link') {
       return { status: (await this.linked(recovery.from, recovery.to)) ? 'done' : 'not-applied' };
@@ -824,8 +951,12 @@ export class Executor {
     if (recovery.priorityTo && this.belowPriority(issue.fields?.priority?.name, recovery.priorityTo)) {
       return { status: 'not-applied' };
     }
+    // Scope steps add the owned label first; a severity-only step (a covered raise) adds none.
+    if (entry.kind !== 'severity' && !(issue.fields?.labels ?? []).includes(OWNED_LABEL)) {
+      return { status: 'not-applied' };
+    }
     if (!recovery.raiseTo) {
-      return { status: (issue.fields?.labels ?? []).includes(OWNED_LABEL) ? 'done' : 'not-applied' };
+      return { status: 'done' };
     }
     const severity = this.config.severityOf(issue.fields?.[this.config.severityField]?.id);
     if ((SEVERITY_RANK[severity] ?? 0) < SEVERITY_RANK[recovery.raiseTo]) {
@@ -849,57 +980,45 @@ export class Executor {
     }
     const { status, key } = await this.reconcileEntry(entry);
     // Confirmed missing: retried under its original journal id before the plan, like any definite failure.
-    if (entry.kind === 'link' && status === 'not-applied') {
-      this.pendingWrites.push({ id: entry.id, from: entry.recovery.from, to: entry.recovery.to });
+    if (RETRIED.has(entry.kind) && status === 'not-applied') {
+      this.pendingWrites.push(retryItem(entry));
     }
-    if (entry.kind === 'severity-comment' && status === 'not-applied') {
-      const { key: target, raise } = entry.recovery;
-      this.pendingWrites.push({ id: entry.id, kind: entry.kind, key: target, raise });
-    }
-    await this.control.settle(entry.id, status, { recovered: true, ...(key ? { key } : {}) });
+    // The result keeps what later runs still need: the ticket and the raise (for the follow-up writes an applied action
+    // owes) and the attempt count (so a write that keeps failing is eventually given up).
+    const ticket = key ?? entry.recovery.key;
+    // Only an action that raised severity owes an explanation; a follow-up write itself owes nothing.
+    const raise = status === 'done' && !RETRIED.has(entry.kind) ? entry.recovery.raise : null;
+    await this.control.settle(entry.id, status, {
+      recovered: true,
+      ...(ticket ? { key: ticket } : {}),
+      ...(raise ? { raise } : {}),
+      attempts: entry.result?.attempts ?? 0,
+      httpStatus: entry.result?.httpStatus ?? null,
+    });
     const message = `${entry.kind} on ${entry.target} from run ${entry.runId} was ${status === 'done' ? 'applied' : 'not applied'}; its alerts are re-planned.`;
     this.outcome.warnings.push({ code: 'recovered', message });
   }
 
-  /** Reconciles reservations left by an interrupted run before anything new is written. */
-  /**
-   * Writes that follow a completed action but have no journal entry yet, because the run stopped in between: the
-   * links of a created ticket and the explanation of a raised severity.
-   */
-  queueFollowUps() {
+  /** Adds follow-up writes to the replay queue, once each, unless already journalled or queued. */
+  enqueue(items) {
     const queued = new Set(this.pendingWrites.map((item) => item.id));
-    const add = (item) => {
-      if (!queued.has(item.id) && !this.control.has(item.id)) {
-        queued.add(item.id);
-        this.pendingWrites.push(item);
-      }
-    };
-    for (const entry of this.control.completed()) {
-      const key = entry.result?.key;
-      if (entry.kind === 'create' && key) {
-        for (const to of entry.recovery?.links ?? []) {
-          add({ id: `${entry.runId}:${key}:link:${to}`, from: key, to });
-        }
-      }
-      if (entry.result?.raise && key) {
-        add({ id: `${entry.id}:severity-comment`, kind: 'severity-comment', key, raise: entry.result.raise });
-      }
+    for (const item of items.filter((candidate) => !queued.has(candidate.id) && !this.control.has(candidate.id))) {
+      queued.add(item.id);
+      this.pendingWrites.push(item);
     }
   }
 
+  /**
+   * Reconciles reservations left by an interrupted run before anything new is written, then queues every follow-up
+   * write still owed: those of completed actions that a stopped run never reserved, and those that definitely
+   * failed (replayed from the journal itself, so one whose retry queue was never saved is still written).
+   */
   async recover() {
     await mapSequential(this.control.pending(), (entry) => this.recoverEntry(entry));
-    // Links and severity comments that definitely did not happen are replayed from the journal itself, so one
-    // whose retry queue was never saved (the job stopped first) is still written.
-    this.queueFollowUps();
+    this.enqueue(this.control.completed().flatMap((entry) => followUps(entry)));
     const queued = new Set(this.pendingWrites.map((item) => item.id));
     for (const entry of this.control.retryable().filter((item) => !queued.has(item.id))) {
-      const { recovery } = entry;
-      this.pendingWrites.push(
-        entry.kind === 'link'
-          ? { id: entry.id, from: recovery.from, to: recovery.to }
-          : { id: entry.id, kind: entry.kind, key: recovery.key, raise: recovery.raise },
-      );
+      this.pendingWrites.push(retryItem(entry));
     }
   }
 
@@ -1165,13 +1284,16 @@ export async function runPending(executor, control, outcome, plan) {
   // Writes queued by earlier runs and writes that recovery just confirmed missing are retried first.
   const queued = uniqueById([...(control.state?.pendingWrites ?? []), ...executor.pendingWrites]);
   executor.pendingWrites = [];
+  // Only failures from before the replay stop the plan: a follow-up still failing blocks its own ticket's ownership
+  // (blockedTickets), never the rest of the week's triage.
+  const blocking = outcome.failures.length;
   let remaining = queued;
   try {
     remaining = await executor.replayPending(queued);
     for (const item of remaining) {
       executor.blockedTickets.add(item.from ?? item.key);
     }
-    if (plan && !outcome.failures.length) {
+    if (plan && !blocking) {
       await executor.execute(plan);
     }
   } finally {
