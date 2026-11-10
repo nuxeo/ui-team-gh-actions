@@ -2,6 +2,12 @@
 
 This repository contains Github Actions shared between workflows used by the UI team to support the CI/CD for [Nuxeo Web UI](https://github.com/nuxeo/nuxeo-web-ui) and [Nuxeo Elements](https://github.com/nuxeo/nuxeo-elements).
 
+## Contents
+
+- [`get-branch`](get-branch/action.yaml): picks the branch to check out in a repository, or its default branch.
+- [`trigger-workflow`](trigger-workflow/action.yaml): triggers a workflow run through the dispatch event and waits for its result.
+- [`dependabot-ai-triage`](dependabot-ai-triage/README.md): reusable workflow ([`.github/workflows/dependabot-ai-triage.yaml`](.github/workflows/dependabot-ai-triage.yaml)) for the weekly AI-assisted triage of Dependabot alerts in Nuxeo Web UI and Nuxeo Elements into Jira and Teams. It is scheduled from Nuxeo Web UI.
+
 ## License
 
 [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0.txt)
