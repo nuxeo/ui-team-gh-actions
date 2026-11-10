@@ -105,17 +105,29 @@ the variables were not updated, the run still reconciles and reports, but refuse
   alone and reported. Before a new ticket is created, ownership and matching tickets are re-read, so work recorded
   while the planner ran is never duplicated. Label and severity changes, the scope comment, the "severity raised"
   comment, the On Hold transition and its reason comment are separate journal steps, so a retry repeats only the
-  unfinished ones. Links to related tickets are made before ownership is recorded; a link or "severity raised"
-  comment that fails is kept in the run state and in the journal, and retried by later runs until it succeeds, and the ticket's ownership waits for it.
+  unfinished ones. Each comment carries a marker naming its ticket and content (not the run), so neither a retry nor a
+  later run that plans the same ticket again posts it twice.
+
+  Follow-up writes (links to related tickets, the On Hold reason, the "severity raised" explanation) are owed by the
+  action that needs them and are never lost: one that fails, or that a stopped run never reached, is replayed by later
+  runs from the journal until it succeeds, and the ticket's ownership waits for it. A follow-up that fails permanently
+  (a client error other than timeout or rate limit) or five times is given up and reported once, so it can be added by
+  hand; a failing follow-up never stops the rest of the week's plan.
+
   The ownership property is written **last**, after the scope, severity and On Hold changes are verified, so an
   interrupted run leaves those alerts unowned and they are simply planned again. A write whose outcome is unknown
-  (timeout, 5xx) stops further writes and is never blindly repeated; the next automatic run reconciles it from Jira
-  before writing anything (whether the link exists, the ticket is On Hold or has the raised severity, the ownership
-  property carries that exact write's id, or the comment carrying that step's own marker is present). Comments and
-  links are also checked before they are written, so a retry never duplicates them even after their journal records
-  were pruned. Preview only reports it. A Teams post whose delivery is unknown is not resent, and no Teams message is
-  sent when the private journal is unavailable. The Teams card is trimmed to a fixed byte budget; omitted lines are in
-  the full report. Re-running the same workflow run does not repeat completed writes.
+  (timeout, 5xx, or a failed check after the write was sent) stops further writes and is never blindly repeated; the
+  next automatic run reconciles it from Jira before writing anything (whether the ticket exists, the link exists, the
+  ticket is On Hold, has the owned label and the raised severity and priority, the ownership property carries that
+  exact write's id, or the comment with that marker is present). Preview only reports it. A Teams post whose delivery
+  is unknown is not resent, and no Teams message is sent when the private journal is unavailable; Teams records and
+  their stored cards are kept for the 30-day re-run window. The Teams card is trimmed to a fixed byte budget; omitted
+  lines are in the full report. Re-running the same workflow run does not repeat completed writes.
+
+  `test/failure-matrix.test.mjs` interrupts every Jira write of a representative run in turn (definite error, unknown
+  outcome before or after the write, runner stopped before or after it) and checks that retries reach the
+  uninterrupted result, that ownership is never recorded before a ticket's required writes, that the next run
+  finishes owed follow-ups, and that a later run re-planning the same tickets repeats no comment.
 
 The checkpoint advances only after a complete automatic run. Collection, planning, validation or write failures make
 the run incomplete: the report and (in automatic mode) the Teams card say "scan incomplete" and name the failure;

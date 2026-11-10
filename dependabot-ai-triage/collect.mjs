@@ -160,7 +160,7 @@ export function ticketQueries(config, alerts) {
   return queries;
 }
 
-async function readTickets(jira, config, alerts, warnings) {
+export async function readTickets(jira, config, alerts, warnings) {
   const fields = [...TICKET_FIELDS, config.severityField];
   const queries = ticketQueries(config, alerts);
   const pages = await Promise.all(queries.map(({ jql }) => jira.search(jql, fields, [OWNERSHIP_PROPERTY])));
@@ -176,12 +176,19 @@ async function readTickets(jira, config, alerts, warnings) {
   const upstream = [...byKey.values()]
     .map((issue) => issue.properties?.[OWNERSHIP_PROPERTY]?.blocker?.upstreamRef)
     .filter((ref) => /^[A-Z][A-Z0-9]+-\d+$/.test(ref ?? '') && !byKey.has(ref));
-  if (upstream.length) {
-    const extra = await jira.search(`key in (${[...new Set(upstream)].join(', ')})`, fields, [OWNERSHIP_PROPERTY]);
-    for (const issue of extra) {
+  // One by one: JQL naming a key that does not exist or cannot be read fails the whole query, and one bad reference
+  // must not stop every later collection. Such a reference is reported instead.
+  await mapSequential([...new Set(upstream)], async (key) => {
+    try {
+      const issue = await jira.issue(key, fields, [OWNERSHIP_PROPERTY]);
       byKey.set(issue.key, issue);
+    } catch (error) {
+      if (![400, 403, 404].includes(error.status)) {
+        throw error;
+      }
+      warnings.push(`Upstream ticket ${key} named by a blocked ticket cannot be read (HTTP ${error.status}).`);
     }
-  }
+  });
   byKey.delete(config.controlIssue);
   return [...byKey.values()].map((issue) => {
     const ticket = toTicket(issue, config);

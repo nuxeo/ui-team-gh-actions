@@ -12,10 +12,50 @@ export const CARD_PROPERTY = 'dependabot-ai-triage-teams-card';
 const RETRY_WINDOW_MS = 30 * 864e5;
 const LOCK_STALE_HOURS = 6;
 const JOURNAL_BUDGET = 28000;
-const RESOLVED = new Set(['done', 'failed', 'not-applied']);
-// Writes that must eventually happen: while they definitely did not, they are replayed and never pruned.
-const RETRIED = new Set(['link', 'severity-comment']);
+// `abandoned`: a follow-up write that failed permanently or too often; reported once, never retried.
+const RESOLVED = new Set(['done', 'failed', 'not-applied', 'abandoned']);
+// Follow-up writes that must eventually happen: while they definitely did not, they are replayed and never pruned.
+export const RETRIED = new Set(['link', 'severity-comment', 'hold-comment']);
 const retryPending = (entry) => RETRIED.has(entry.kind) && ['failed', 'not-applied'].includes(entry.status);
+
+/** The queue item that replays a follow-up write under its own journal id. */
+export function retryItem(entry) {
+  const { recovery } = entry;
+  if (entry.kind === 'link') {
+    return { id: entry.id, from: recovery.from, to: recovery.to };
+  }
+  const payload = entry.kind === 'hold-comment' ? { blocker: recovery.blocker } : { raise: recovery.raise };
+  return { id: entry.id, kind: entry.kind, key: recovery.key, ...payload };
+}
+
+/**
+ * Writes that must follow a completed action: the links of a created ticket, the reason of an On Hold transition
+ * and the explanation of a raised severity. Their ids match the ones the executor uses when it makes them directly.
+ */
+export function followUps(entry) {
+  const key = entry.result?.key ?? entry.recovery?.key;
+  if (entry.status !== 'done' || !key) {
+    return [];
+  }
+  const items = [];
+  if (entry.kind === 'create') {
+    for (const to of entry.recovery?.links ?? []) {
+      items.push({ id: `${entry.runId}:${key}:link:${to}`, from: key, to });
+    }
+  }
+  if (entry.kind === 'hold' && entry.recovery?.blocker) {
+    items.push({
+      id: `${entry.runId}:${key}:hold-comment`,
+      kind: 'hold-comment',
+      key,
+      blocker: entry.recovery.blocker,
+    });
+  }
+  if (entry.result.raise && !RETRIED.has(entry.kind)) {
+    items.push({ id: `${entry.id}:severity-comment`, kind: 'severity-comment', key, raise: entry.result.raise });
+  }
+  return items;
+}
 
 export class LockHeldError extends Error {}
 
@@ -161,7 +201,7 @@ export class ControlState {
     return this.journal.entries.filter((entry) => entry.status === 'done');
   }
 
-  /** Links and severity comments that definitely did not happen yet; replayed under their own ids until done. */
+  /** Follow-up writes that definitely did not happen yet; replayed under their own ids until done. */
   retryable() {
     return this.journal.entries.filter((entry) => retryPending(entry) && entry.recovery);
   }
@@ -216,22 +256,36 @@ export class ControlState {
   async persistJournal() {
     // Keep the property under Jira's size limit by dropping the oldest resolved entries. Reserved and uncertain
     // entries are kept: they are what stops an interrupted write (or Teams send) from being repeated.
+    const prunedCards = [];
     while (jsonBytes(this.journal) > JOURNAL_BUDGET) {
       const index = this.journal.entries.findIndex((entry) => this.prunable(entry));
       if (index < 0) {
         throw new Error('Action journal is full of unresolved writes; manual reconciliation required.');
       }
-      this.journal.entries.splice(index, 1);
+      const [pruned] = this.journal.entries.splice(index, 1);
+      if (pruned.kind === 'teams') {
+        prunedCards.push(pruned.runId);
+      }
     }
     await this.jira.setProperty(this.issueKey, JOURNAL_PROPERTY, this.journal);
+    await mapSequential(prunedCards, (runId) => this.discardCard(runId));
   }
 
-  /** Resolved entries may go, except Teams delivery records that a re-run of their workflow run still needs. */
+  /**
+   * Resolved entries may go, except follow-up writes still to be made, actions whose follow-ups are not reserved
+   * yet, and Teams records a re-run of their workflow run may still need. Teams records of any outcome go after
+   * that window, so unknown deliveries cannot accumulate.
+   */
   prunable(entry, now = Date.now()) {
+    if (entry.kind === 'teams') {
+      // An entry of unknown age is kept: it may still be inside the re-run window.
+      const at = Date.parse(entry.settledAt ?? entry.at);
+      return entry.status !== 'reserved' && Number.isFinite(at) && now - at > RETRY_WINDOW_MS;
+    }
     if (!RESOLVED.has(entry.status) || retryPending(entry)) {
       return false;
     }
-    return entry.kind !== 'teams' || now - Date.parse(entry.settledAt ?? entry.at ?? 0) > RETRY_WINDOW_MS;
+    return followUps(entry).every((item) => this.has(item.id));
   }
 
   /** Records intent before a remote write, so an interrupted write is reconciled instead of repeated. */
