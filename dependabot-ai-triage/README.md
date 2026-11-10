@@ -105,8 +105,17 @@ the variables were not updated, the run still reconciles and reports, but refuse
   alone and reported. Before a new ticket is created, ownership and matching tickets are re-read, so work recorded
   while the planner ran is never duplicated. Label and severity changes, the scope comment, the "severity raised"
   comment, the On Hold transition and its reason comment are separate journal steps, so a retry repeats only the
-  unfinished ones. Each comment carries a marker naming its ticket and content (not the run), so neither a retry nor a
-  later run that plans the same ticket again posts it twice.
+  unfinished ones. Each On Hold reason carries a marker naming its ticket and content, and each severity explanation
+  the step that made the change, so neither a retry nor a later run that plans the same ticket again posts it twice.
+  A "Reason for On Hold" comment is posted only when this automation puts a ticket On Hold, or when a ticket it holds
+  gets a different blocker; a ticket a person already put On Hold keeps that person's reason, and adopting it only
+  records the blocker in the ownership property.
+
+  The Teams card always has the same layout: the run time; "scan incomplete" with the failures if the scan was not
+  complete; the findings result (new findings by severity, or "No new untriaged Dependabot findings were identified."
+  — never stated for an incomplete scan); the number of open alerts and how many were already tracked; existing
+  tickets now tracked; tickets created; tickets updated (scope or severity); changed blockers; items needing review;
+  and the repositories, full report link and run id.
 
   Follow-up writes (links to related tickets, the On Hold reason, the "severity raised" explanation) are owed by the
   action that needs them and are never lost: one that fails, or that a stopped run never reached, is replayed by later

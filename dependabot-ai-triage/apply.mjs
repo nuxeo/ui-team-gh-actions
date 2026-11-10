@@ -358,10 +358,11 @@ export class Executor {
   }
 
   /**
-   * Puts blocked work On Hold with its reason. The reason is its own step and is resumed whenever the ticket was put
-   * On Hold here, or no blocked ownership shows that an earlier run already gave it (a transition that succeeded
-   * before its comment failed leaves the ticket On Hold, so the On Hold status alone does not prove the reason).
-   * A changed blocker (type, upstream reference, or an update the planner reported) gets its new reason too.
+   * Puts blocked work On Hold with its reason. A reason is posted only when this automation puts the ticket On Hold,
+   * or when a ticket it already owns as blocked gets a different blocker (type, upstream reference, or an update the
+   * planner reported). A ticket a person already put On Hold carries that person's reason: adopting it only records
+   * the blocker in the ownership property. If a run stops after its own transition, the hold step still owes its
+   * reason through the journal, so it is posted later.
    */
   async holdWithReason(group, target, report) {
     const { runId } = this.inventory;
@@ -380,9 +381,15 @@ export class Executor {
         return false;
       }
     }
-    const recorded = target.ownership?.blocker;
-    const blockerMoved = recorded?.type !== group.blocker?.type || recorded?.upstreamRef !== group.blocker?.upstreamRef;
-    if (holdNow || target.ownership?.kind !== 'blocked' || blockerMoved || report.blockerChanged) {
+    const recorded = target.ownership?.kind === 'blocked' ? target.ownership.blocker : null;
+    const blockerMoved =
+      Boolean(recorded) &&
+      (recorded.type !== group.blocker?.type || recorded.upstreamRef !== group.blocker?.upstreamRef);
+    // The journal shows whether this automation put the ticket On Hold (in this or an earlier run).
+    const heldHere = this.control.journal.entries.some(
+      (entry) => entry.kind === 'hold' && entry.status === 'done' && entry.recovery?.key === target.key,
+    );
+    if (holdNow || heldHere || blockerMoved || (recorded && report.blockerChanged)) {
       // The id names the blocker too: a re-run that plans a different reason writes that reason.
       const id = holdCommentId(runId, target.key, group.blocker);
       if (!(await this.act(id, 'hold-comment', target.key, this.holdCommentAction(target.key, group.blocker)))) {

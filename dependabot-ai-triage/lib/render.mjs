@@ -388,6 +388,17 @@ function ticketSections(outcome, config, controlUrl) {
       ...limited(created, (group) => entry(group, group.teamsLine), controlUrl),
     );
   }
+  const adopted = outcome.groups.filter((group) => group.action === 'adopted');
+  if (adopted.length) {
+    const keys = adopted
+      .slice(0, TEAMS_SECTION_LIMIT)
+      .map((group) => `[${group.ticketKey}](${browse(config.jiraSite, group.ticketKey)})`);
+    const more = adopted.length > TEAMS_SECTION_LIMIT ? ` · +${adopted.length - TEAMS_SECTION_LIMIT} more` : '';
+    blocks.push(
+      block(`**Existing tickets now tracked · ${adopted.length}**`, { separator: true }),
+      block(`${keys.join(' · ')}${more}`, { spacing: 'None' }),
+    );
+  }
   if (updated.length || raised.length) {
     blocks.push(
       block(`**Tickets updated · ${updated.length + raised.length}**`, { separator: true }),
@@ -451,13 +462,20 @@ export function teamsCard(outcome, config, now = new Date()) {
   const newTotal = SEVERITIES.reduce((sum, severity) => sum + (outcome.newBySeverity[severity] ?? 0), 0);
   const tickets = ticketSections(outcome, config, controlUrl);
   const review = reviewLines(outcome);
-  if (outcome.complete && newTotal === 0 && !tickets.length && !review.length) {
-    body.push(
-      block('No new untriaged Dependabot findings were identified.'),
-      block('🐛 The bugs took the day off. We checked anyway.'),
-    );
-  } else if (newTotal > 0) {
+  // The findings result is always stated, whatever else changed; an incomplete scan never claims "no new findings".
+  if (newTotal > 0) {
     body.push(...findingBlocks(outcome));
+  } else if (outcome.complete) {
+    body.push(block('No new untriaged Dependabot findings were identified.'));
+    if (!tickets.length && !review.length) {
+      body.push(block('🐛 The bugs took the day off. We checked anyway.'));
+    }
+  }
+  if (outcome.complete && outcome.counts) {
+    const { alerts, covered } = outcome.counts;
+    body.push(
+      block(`${alerts} open alert(s) · ${covered} already tracked on tickets before this run`, { isSubtle: true }),
+    );
   }
   body.push(...tickets, ...blockerBlocks(outcome, config));
   if (review.length) {

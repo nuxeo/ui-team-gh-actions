@@ -1429,10 +1429,17 @@ test('a hold whose reason comment failed is completed by the next attempt before
   await first.exec.create(unpatched, report);
   const key = report.ticketKey;
   assert.equal(jira.issues.get(key).fields.status.name, 'On Hold');
+  assert.equal(jira.issues.get(key).properties[OWNERSHIP_PROPERTY], undefined);
+  // The next attempt recovers first: the owed reason is replayed, then ownership is recorded without a second reason.
   const retry = await executor(jira, tickets);
+  await retry.exec.recover();
+  assert.deepEqual(await retry.exec.replayPending(retry.exec.pendingWrites), []);
   const done = await retry.exec.finish(unpatched, { key, onHold: true, ownership: null }, [], {});
   assert.equal(done, true);
-  assert.ok(jira.issues.get(key).comments.some((comment) => JSON.stringify(comment).includes('Reason for On Hold')));
+  const reasons = jira.issues
+    .get(key)
+    .comments.filter((comment) => JSON.stringify(comment).includes('Reason for On Hold'));
+  assert.equal(reasons.length, 1);
   assert.ok(jira.issues.get(key).properties[OWNERSHIP_PROPERTY]);
 });
 
@@ -2191,17 +2198,35 @@ test('recovery gives up an entry whose ticket is gone and still recovers the oth
 test('a re-run that plans a different blocker posts the new reason before ownership', async () => {
   const tickets = registerTickets();
   const jira = new FakeJira(tickets);
-  const first = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-45', 'low', [106], {
+  jira.issues.get('LIB-24').fields.status = { name: 'Open', statusCategory: { key: 'new' } };
+  const first = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-24', 'low', [101], {
     ...blocked('no-upstream-patch', 'https://github.com/advisories/GHSA-0000-0000-0007'),
   });
-  const replanned = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-45', 'low', [106], {
-    ...blocked('upstream-release-pending', 'LIB-24'),
+  const replanned = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-24', 'low', [101], {
+    ...blocked('upstream-release-pending', 'LIB-44'),
   });
-  const target = { key: 'LIB-45', onHold: true, ownership: null };
-  await (await executor(jira, tickets)).exec.holdWithReason(first, target, {});
-  await (await executor(jira, tickets)).exec.holdWithReason(replanned, target, {});
-  const texts = jira.issues.get('LIB-45').comments.map((comment) => JSON.stringify(comment));
+  // This automation puts the ticket On Hold, then a re-run of the same run plans a different blocker.
+  await (
+    await executor(jira, tickets)
+  ).exec.holdWithReason(first, { key: 'LIB-24', onHold: false, ownership: null }, {});
+  await (
+    await executor(jira, tickets)
+  ).exec.holdWithReason(replanned, { key: 'LIB-24', onHold: true, ownership: null }, {});
+  const texts = jira.issues.get('LIB-24').comments.map((comment) => JSON.stringify(comment));
   assert.equal(texts.filter((text) => text.includes('Reason for On Hold')).length, 2);
+});
+
+test('adopting a ticket a person already put On Hold records the blocker without another reason comment', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const adopt = group(`${EL}:pkg-merge`, EL, 'adopt', 'LIB-45', 'low', [106], {
+    ...blocked('no-upstream-patch', 'https://github.com/advisories/GHSA-0000-0000-0007'),
+  });
+  const { exec } = await executor(jira, tickets);
+  const done = await exec.finish(adopt, { key: 'LIB-45', onHold: true, ownership: null }, [], {});
+  assert.equal(done, true);
+  assert.equal(jira.issues.get('LIB-45').comments.length, 0);
+  assert.equal(jira.issues.get('LIB-45').properties[OWNERSHIP_PROPERTY].blocker.type, 'no-upstream-patch');
 });
 
 test('a retried step records the recovery data of the attempt that is about to write', async () => {
@@ -2264,4 +2289,67 @@ test('create metadata follows pagination when Jira returns fewer fields than req
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test('the Teams card always states the findings result, even when tickets changed', () => {
+  const adopted = (key, kind = 'actionable') => {
+    return {
+      ticketKey: key,
+      repository: EL,
+      severity: 'medium',
+      kind,
+      action: 'adopted',
+      blockerChanged: false,
+    };
+  };
+  const outcome = {
+    runId: RUN,
+    complete: true,
+    failures: [],
+    firstReconciliation: true,
+    newBySeverity: {},
+    counts: { alerts: 24, covered: 0 },
+    groups: [adopted('LIB-24'), adopted('LIB-44'), adopted('LIB-45', 'blocked')],
+    severityRaises: [{ ticket: 'LIB-44', from: 'unset', to: 'medium', alerts: [], applied: true }],
+    needsReview: [],
+    closedMismatches: [],
+    repositories: [{ name: WEB }, { name: EL }],
+  };
+  const lines = teamsCard(outcome, { ...config, controlIssue: 'APP-99' }).attachments[0].content.body.map(
+    (item) => item.text,
+  );
+  const text = lines.join('\n');
+  assert.match(text, /No new untriaged Dependabot findings were identified\./);
+  assert.match(text, /24 open alert\(s\) · 0 already tracked on tickets before this run/);
+  assert.match(text, /Existing tickets now tracked · 3/);
+  assert.match(text, /LIB-44.*severity raised to Medium/);
+  assert.doesNotMatch(text, /took the day off/);
+  const order = ['No new untriaged', 'open alert(s)', 'now tracked', 'Tickets updated', 'Run ID'].map((part) =>
+    lines.findIndex((line) => line?.includes(part)),
+  );
+  assert.deepEqual(
+    [...order].sort((a, b) => a - b),
+    order,
+  );
+});
+
+test('an incomplete scan never claims there were no new findings', () => {
+  const card = teamsCard(
+    {
+      runId: RUN,
+      complete: false,
+      failures: ['acme/lib: GitHub GET alerts failed: HTTP 403'],
+      newBySeverity: {},
+      counts: { alerts: 0, covered: 0 },
+      groups: [],
+      severityRaises: [],
+      needsReview: [],
+      closedMismatches: [],
+      repositories: [{ name: WEB }, { name: EL }],
+    },
+    { ...config, controlIssue: 'APP-99' },
+  );
+  const text = JSON.stringify(card);
+  assert.match(text, /scan incomplete/);
+  assert.doesNotMatch(text, /No new untriaged|open alert\(s\)/);
 });
