@@ -157,6 +157,10 @@ export class ControlState {
     );
   }
 
+  completed() {
+    return this.journal.entries.filter((entry) => entry.status === 'done');
+  }
+
   /** Links and severity comments that definitely did not happen yet; replayed under their own ids until done. */
   retryable() {
     return this.journal.entries.filter((entry) => retryPending(entry) && entry.recovery);

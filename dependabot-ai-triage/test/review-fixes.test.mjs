@@ -1828,3 +1828,66 @@ test('a failed link is replayed from the journal even when its retry queue was n
   assert.deepEqual(await exec.replayPending(exec.pendingWrites), []);
   assert.ok(jira.calls.some((call) => call.name === 'link'));
 });
+
+test('a failed verification after a sent severity edit is an unknown outcome, reconciled next run', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  jira.issues.get('LIB-44').fields[config.severityField] = { id: severityId('medium') };
+  const issue = jira.issue.bind(jira);
+  let reads = 0;
+  jira.issue = async (key, fields, properties) => {
+    if (key === 'LIB-44' && fields?.includes('parent') && reads++ === 0) {
+      throw new Error('HTTP 503');
+    }
+    return issue(key, fields, properties);
+  };
+  const { exec, control } = await executor(jira, tickets);
+  const extend = group(`${EL}:refresh`, EL, 'extend', 'LIB-44', 'high', [104, 105, 107], { updateNote: 'x' });
+  await exec.update(extend, {});
+  assert.equal(control.journal.entries.find((item) => item.kind === 'extend').status, 'uncertain');
+});
+
+test('a held, already-owned ticket gets the new reason when its blocker changes', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const { exec } = await executor(jira, tickets);
+  const ownership = { kind: 'blocked', blocker: { type: 'no-upstream-patch', upstreamRef: 'https://example/old' } };
+  const keep = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-45', 'low', [106], {
+    ...blocked('upstream-release-pending', 'LIB-1'),
+  });
+  const done = await exec.holdWithReason(keep, { key: 'LIB-45', onHold: true, ownership }, {});
+  assert.equal(done, true);
+  assert.ok(
+    jira.issues.get('LIB-45').comments.some((comment) => JSON.stringify(comment).includes('Reason for On Hold')),
+  );
+
+  const unchanged = new FakeJira(tickets);
+  const same = { kind: 'blocked', blocker: { type: 'upstream-release-pending', upstreamRef: 'LIB-1' } };
+  const second = await executor(unchanged, tickets);
+  await second.exec.holdWithReason(keep, { key: 'LIB-45', onHold: true, ownership: same }, {});
+  assert.equal(unchanged.issues.get('LIB-45').comments.length, 0);
+});
+
+test('links of a created ticket and the explanation of a raise are queued when the run stopped before them', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const control = new ControlState(jira, config.controlIssue);
+  await control.load();
+  await control.reserve({
+    id: 'old:x:create',
+    kind: 'create',
+    target: 'x',
+    runId: 'old',
+    recovery: { label: 'dat-x', links: ['LIB-44'] },
+  });
+  await control.settle('old:x:create', 'done', { key: 'LIB-3000' });
+  const raise = { from: 'medium', to: 'high', alerts: ['#107'] };
+  await control.reserve({ id: 'old:r:extend:s', kind: 'extend', target: 'LIB-44', runId: 'old', recovery: {} });
+  await control.settle('old:r:extend:s', 'done', { key: 'LIB-44', raise });
+  const { exec } = await executor(jira, tickets);
+  await exec.recover();
+  assert.deepEqual(exec.pendingWrites, [
+    { id: 'old:LIB-3000:link:LIB-44', from: 'LIB-3000', to: 'LIB-44' },
+    { id: 'old:r:extend:s:severity-comment', kind: 'severity-comment', key: 'LIB-44', raise },
+  ]);
+});
