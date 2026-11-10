@@ -102,6 +102,9 @@ export class FakeJira {
   }
 
   async recentComments(key) {
+    if (!this.issues.has(key)) {
+      throw Object.assign(new Error('Jira GET comments: HTTP 404'), { status: 404 });
+    }
     return this.issues.get(key).comments.map((body) => {
       return { body };
     });

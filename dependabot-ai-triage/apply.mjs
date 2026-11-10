@@ -14,7 +14,7 @@ import {
   teamsCard,
   ticketDescription,
 } from './lib/render.mjs';
-import { ControlState, RETRIED, followUps, retryItem } from './lib/state.mjs';
+import { ControlState, RETRIED, commentMarker, followUps, holdCommentId, holdMarker, retryItem } from './lib/state.mjs';
 import {
   SEVERITY_RANK,
   adfDoc,
@@ -39,25 +39,8 @@ export function quarterLabel(quarter) {
   return quarter.replace('-', '_');
 }
 
-/**
- * Names what a comment says about which ticket, never which run wrote it: recovery proves a write by its marker,
- * and a later run that would post the same comment finds it and does not repeat it.
- */
-export function commentMarker(...parts) {
-  return `dat-${shortHash(parts)}`;
-}
+export { commentMarker, holdMarker };
 
-// A blocker reason is identified by everything it says, so an updated reason, mitigation or recheck is posted.
-export const holdMarker = (key, blocker) =>
-  commentMarker(
-    'hold',
-    key,
-    blocker?.type,
-    blocker?.upstreamRef ?? null,
-    blocker?.reason,
-    blocker?.mitigation,
-    blocker?.recheck,
-  );
 // A raise happens once, so its explanation is identified by the step that made it: every raise is explained.
 export const severityMarker = (commentId) => commentMarker('severity', commentId);
 
@@ -166,6 +149,8 @@ export class Executor {
     }
     if (previous) {
       previous.status = 'reserved';
+      // Recovery must reconcile what this attempt is about to write, which can differ from the first attempt.
+      previous.recovery = recovery ?? previous.recovery;
       await this.control.persistJournal();
     } else {
       await this.control.reserve({ id, kind, target, runId: this.inventory.runId, recovery, signature });
@@ -398,7 +383,8 @@ export class Executor {
     const recorded = target.ownership?.blocker;
     const blockerMoved = recorded?.type !== group.blocker?.type || recorded?.upstreamRef !== group.blocker?.upstreamRef;
     if (holdNow || target.ownership?.kind !== 'blocked' || blockerMoved || report.blockerChanged) {
-      const id = `${runId}:${target.key}:hold-comment`;
+      // The id names the blocker too: a re-run that plans a different reason writes that reason.
+      const id = holdCommentId(runId, target.key, group.blocker);
       if (!(await this.act(id, 'hold-comment', target.key, this.holdCommentAction(target.key, group.blocker)))) {
         if (this.control.find(id)?.status === 'failed') {
           this.pendingWrites.push({ id, kind: 'hold-comment', key: target.key, blocker: group.blocker });
@@ -1014,7 +1000,18 @@ export class Executor {
    * failed (replayed from the journal itself, so one whose retry queue was never saved is still written).
    */
   async recover() {
-    await mapSequential(this.control.pending(), (entry) => this.recoverEntry(entry));
+    await mapSequential(this.control.pending(), async (entry) => {
+      try {
+        await this.recoverEntry(entry);
+      } catch (error) {
+        // A ticket deleted or no longer readable can never be reconciled: give that entry up and recover the rest.
+        if (![400, 403, 404].includes(error.status)) {
+          throw error;
+        }
+        const result = { message: error.message, httpStatus: error.status, attempts: entry.result?.attempts ?? 0 };
+        await this.abandon(entry.id, entry.kind, entry.target, result);
+      }
+    });
     this.enqueue(this.control.completed().flatMap((entry) => followUps(entry)));
     const queued = new Set(this.pendingWrites.map((item) => item.id));
     for (const entry of this.control.retryable().filter((item) => !queued.has(item.id))) {

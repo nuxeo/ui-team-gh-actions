@@ -144,7 +144,13 @@ export function jiraClient({ site, email, token }) {
     const data = await call('GET', target, undefined, 'create metadata');
     const page = data.fields ?? data.values ?? [];
     const fields = [...collected, ...page];
-    return page.length < 200 ? fields : metadataPages(project, issueTypeId, fields, startAt + 200);
+    // Jira may return fewer than requested per page; its own metadata says when the list is complete.
+    const complete =
+      data.isLast === true ||
+      page.length === 0 ||
+      (Number.isFinite(data.total) && fields.length >= data.total) ||
+      (data.isLast === undefined && !Number.isFinite(data.total) && page.length < (data.maxResults ?? 200));
+    return complete ? fields : metadataPages(project, issueTypeId, fields, startAt + page.length);
   };
   return {
     call,
