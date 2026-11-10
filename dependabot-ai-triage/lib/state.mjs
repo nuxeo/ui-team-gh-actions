@@ -1,4 +1,26 @@
-import { jsonBytes, mapSequential } from './util.mjs';
+import { jsonBytes, mapSequential, shortHash } from './util.mjs';
+
+/**
+ * Names what a comment says about which ticket, never which run wrote it: recovery proves a write by its marker,
+ * and a later run that would post the same comment finds it and does not repeat it.
+ */
+export function commentMarker(...parts) {
+  return `dat-${shortHash(parts)}`;
+}
+
+// A blocker reason is identified by everything it says, so an updated reason, mitigation or recheck is posted.
+export const holdMarker = (key, blocker) =>
+  commentMarker(
+    'hold',
+    key,
+    blocker?.type,
+    blocker?.upstreamRef ?? null,
+    blocker?.reason,
+    blocker?.mitigation,
+    blocker?.recheck,
+  );
+
+export const holdCommentId = (runId, key, blocker) => `${runId}:${key}:hold-comment:${holdMarker(key, blocker)}`;
 
 export const STATE_PROPERTY = 'dependabot-ai-triage-state';
 export const JOURNAL_PROPERTY = 'dependabot-ai-triage-journal';
@@ -45,7 +67,7 @@ export function followUps(entry) {
   }
   if (entry.kind === 'hold' && entry.recovery?.blocker) {
     items.push({
-      id: `${entry.runId}:${key}:hold-comment`,
+      id: holdCommentId(entry.runId, key, entry.recovery.blocker),
       kind: 'hold-comment',
       key,
       blocker: entry.recovery.blocker,

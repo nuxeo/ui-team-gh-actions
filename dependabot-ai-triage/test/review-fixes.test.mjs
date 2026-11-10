@@ -15,7 +15,7 @@ import {
   selectCandidates,
   ticketQueries,
 } from '../collect.mjs';
-import { anonymouslyReadable, npmClient } from '../lib/clients.mjs';
+import { anonymouslyReadable, jiraClient, npmClient } from '../lib/clients.mjs';
 import { DEFAULT_CONFIG, loadConfig } from '../lib/config.mjs';
 import { validatePlan } from '../lib/plan-validator.mjs';
 import { OWNED_LABEL, OWNERSHIP_PROPERTY, blockerRecheck, fingerprint, reconcile } from '../lib/reconcile.mjs';
@@ -2154,4 +2154,114 @@ test('a covered raise is not written when the ticket changes between its two rea
   await exec.raiseCovered({ ticket: 'APP-31', from: 'medium', to: 'high', alerts: [`${WEB}#14`] }, new Set());
   assert.equal(jira.calls.filter((call) => call.name === 'edit').length, 0);
   assert.match(outcome.failures.join(), /changed while this run was writing/);
+});
+
+// Review round on e07be12.
+
+test('recovery gives up an entry whose ticket is gone and still recovers the others', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const control = new ControlState(jira, config.controlIssue);
+  await control.load();
+  const gone = 'old:GONE-1:hold-comment:x';
+  await control.reserve({
+    id: gone,
+    kind: 'hold-comment',
+    target: 'GONE-1',
+    runId: 'old',
+    recovery: { key: 'GONE-1', markers: ['dat-x'] },
+  });
+  const link = 'old:LIB-44:link:LIB-24';
+  await control.reserve({
+    id: link,
+    kind: 'link',
+    target: 'x',
+    runId: 'old',
+    recovery: { from: 'LIB-44', to: 'LIB-24' },
+  });
+  const { exec, outcome } = await executor(jira, tickets);
+  await exec.recover();
+  const reloaded = new ControlState(jira, config.controlIssue);
+  await reloaded.load();
+  assert.equal(reloaded.find(gone).status, 'abandoned');
+  assert.equal(reloaded.find(link).status, 'not-applied');
+  assert.ok(outcome.warnings.some((warning) => warning.code === 'abandoned'));
+});
+
+test('a re-run that plans a different blocker posts the new reason before ownership', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const first = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-45', 'low', [106], {
+    ...blocked('no-upstream-patch', 'https://github.com/advisories/GHSA-0000-0000-0007'),
+  });
+  const replanned = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-45', 'low', [106], {
+    ...blocked('upstream-release-pending', 'LIB-24'),
+  });
+  const target = { key: 'LIB-45', onHold: true, ownership: null };
+  await (await executor(jira, tickets)).exec.holdWithReason(first, target, {});
+  await (await executor(jira, tickets)).exec.holdWithReason(replanned, target, {});
+  const texts = jira.issues.get('LIB-45').comments.map((comment) => JSON.stringify(comment));
+  assert.equal(texts.filter((text) => text.includes('Reason for On Hold')).length, 2);
+});
+
+test('a retried step records the recovery data of the attempt that is about to write', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const { exec, control } = await executor(jira, tickets);
+  const id = 'run:LIB-44:adopt:sig';
+  await control.reserve({
+    id,
+    kind: 'adopt',
+    target: 'LIB-44',
+    runId: RUN,
+    recovery: { key: 'LIB-44', raiseTo: null },
+  });
+  await control.settle(id, 'failed', { message: 'HTTP 400' });
+  const fresh = { key: 'LIB-44', raiseTo: 'critical' };
+  await exec.act(
+    id,
+    'adopt',
+    'LIB-44',
+    exec.withRecovery(async () => {
+      return { key: 'LIB-44' };
+    }, fresh),
+  );
+  assert.deepEqual(control.find(id).recovery, fresh);
+});
+
+test('create metadata follows pagination when Jira returns fewer fields than requested', async () => {
+  const original = globalThis.fetch;
+  const pages = [
+    {
+      fields: Array.from({ length: 50 }, (_, i) => {
+        return { fieldId: `f${i}` };
+      }),
+      maxResults: 50,
+      total: 60,
+      isLast: false,
+    },
+    {
+      fields: [
+        { fieldId: 'customfield_12201' },
+        ...Array.from({ length: 9 }, (_, i) => {
+          return { fieldId: `g${i}` };
+        }),
+      ],
+      isLast: true,
+    },
+  ];
+  const starts = [];
+  try {
+    globalThis.fetch = async (url) => {
+      starts.push(Number(new URL(url).searchParams.get('startAt')));
+      return new Response(JSON.stringify(pages[starts.length - 1]), { status: 200 });
+    };
+    const jira = jiraClient({ site: 'https://jira.example', email: 'a@b.c', token: 't' });
+    const fields = await jira.createFields('APP', '10004');
+    assert.equal(fields.length, 60);
+    assert.deepEqual(starts, [0, 50]);
+    assert.ok(fields.some((field) => field.fieldId === 'customfield_12201'));
+  } finally {
+    globalThis.fetch = original;
+  }
 });
