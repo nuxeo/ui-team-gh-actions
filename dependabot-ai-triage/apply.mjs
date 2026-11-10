@@ -309,7 +309,12 @@ export class Executor {
     };
     if (Object.keys(fields).length) {
       await this.jira.edit(key, fields);
-      await this.verifyIssue(key, { severity, priority });
+      try {
+        await this.verifyIssue(key, { severity, priority });
+      } catch (error) {
+        // The edit was sent: an unverified outcome is reconciled from Jira by the next run, never assumed failed.
+        throw Object.assign(error, { uncertain: true });
+      }
     }
   }
 
@@ -346,6 +351,7 @@ export class Executor {
    * Puts blocked work On Hold with its reason. The reason is its own step and is resumed whenever the ticket was put
    * On Hold here, or no blocked ownership shows that an earlier run already gave it (a transition that succeeded
    * before its comment failed leaves the ticket On Hold, so the On Hold status alone does not prove the reason).
+   * A changed blocker (type, upstream reference, or an update the planner reported) gets its new reason too.
    */
   async holdWithReason(group, target, report) {
     const { runId } = this.inventory;
@@ -363,7 +369,9 @@ export class Executor {
         return false;
       }
     }
-    if (holdNow || target.ownership?.kind !== 'blocked') {
+    const recorded = target.ownership?.blocker;
+    const blockerMoved = recorded?.type !== group.blocker?.type || recorded?.upstreamRef !== group.blocker?.upstreamRef;
+    if (holdNow || target.ownership?.kind !== 'blocked' || blockerMoved || report.blockerChanged) {
       const id = `${runId}:${target.key}:hold-comment`;
       const marker = actionMarker(id, 'reason');
       const reason = this.withRecovery(
@@ -473,7 +481,8 @@ export class Executor {
       await this.verifyIssue(key, { severity: group.severity, epic: this.config.epic });
       return { key, detail: existing.length ? '(reused the ticket from an interrupted attempt of this run)' : '' };
     };
-    run.recovery = { label };
+    // The related tickets travel with the reservation, so links a stopped run never made are still made later.
+    run.recovery = { label, links: group.relatedTickets ?? [] };
     const signature = this.signature(group);
     const id = `${runId}:${group.remediationId}:create`;
     const result = await this.act(id, 'create', group.remediationId, run, signature);
@@ -853,10 +862,36 @@ export class Executor {
   }
 
   /** Reconciles reservations left by an interrupted run before anything new is written. */
+  /**
+   * Writes that follow a completed action but have no journal entry yet, because the run stopped in between: the
+   * links of a created ticket and the explanation of a raised severity.
+   */
+  queueFollowUps() {
+    const queued = new Set(this.pendingWrites.map((item) => item.id));
+    const add = (item) => {
+      if (!queued.has(item.id) && !this.control.has(item.id)) {
+        queued.add(item.id);
+        this.pendingWrites.push(item);
+      }
+    };
+    for (const entry of this.control.completed()) {
+      const key = entry.result?.key;
+      if (entry.kind === 'create' && key) {
+        for (const to of entry.recovery?.links ?? []) {
+          add({ id: `${entry.runId}:${key}:link:${to}`, from: key, to });
+        }
+      }
+      if (entry.result?.raise && key) {
+        add({ id: `${entry.id}:severity-comment`, kind: 'severity-comment', key, raise: entry.result.raise });
+      }
+    }
+  }
+
   async recover() {
     await mapSequential(this.control.pending(), (entry) => this.recoverEntry(entry));
     // Links and severity comments that definitely did not happen are replayed from the journal itself, so one
     // whose retry queue was never saved (the job stopped first) is still written.
+    this.queueFollowUps();
     const queued = new Set(this.pendingWrites.map((item) => item.id));
     for (const entry of this.control.retryable().filter((item) => !queued.has(item.id))) {
       const { recovery } = entry;
