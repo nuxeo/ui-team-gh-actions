@@ -1857,27 +1857,6 @@ test('a failed verification after a sent severity edit is an unknown outcome, re
   assert.equal(control.journal.entries.find((item) => item.kind === 'extend').status, 'uncertain');
 });
 
-test('a held, already-owned ticket gets the new reason when its blocker changes', async () => {
-  const tickets = registerTickets();
-  const jira = new FakeJira(tickets);
-  const { exec } = await executor(jira, tickets);
-  const ownership = { kind: 'blocked', blocker: { type: 'no-upstream-patch', upstreamRef: 'https://example/old' } };
-  const keep = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-45', 'low', [106], {
-    ...blocked('upstream-release-pending', 'LIB-1'),
-  });
-  const done = await exec.holdWithReason(keep, { key: 'LIB-45', onHold: true, ownership }, {});
-  assert.equal(done, true);
-  assert.ok(
-    jira.issues.get('LIB-45').comments.some((comment) => JSON.stringify(comment).includes('Reason for On Hold')),
-  );
-
-  const unchanged = new FakeJira(tickets);
-  const same = { kind: 'blocked', blocker: { type: 'upstream-release-pending', upstreamRef: 'LIB-1' } };
-  const second = await executor(unchanged, tickets);
-  await second.exec.holdWithReason(keep, { key: 'LIB-45', onHold: true, ownership: same }, {});
-  assert.equal(unchanged.issues.get('LIB-45').comments.length, 0);
-});
-
 test('links of a created ticket and the explanation of a raise are queued when the run stopped before them', async () => {
   const tickets = registerTickets();
   const jira = new FakeJira(tickets);
@@ -2051,25 +2030,6 @@ test('a created ticket whose verification read fails is an unknown outcome, reco
   assert.equal(control.journal.entries.find((item) => item.kind === 'create').status, 'uncertain');
 });
 
-test('an updated On Hold reason is posted even when the blocker type and reference are unchanged', async () => {
-  const tickets = registerTickets();
-  const jira = new FakeJira(tickets);
-  const ownership = { kind: 'blocked', blocker: { type: 'upstream-release-pending', upstreamRef: 'LIB-24' } };
-  const first = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-45', 'low', [106], {
-    ...blocked('upstream-release-pending', 'LIB-24'),
-  });
-  const updated = structuredClone(first);
-  updated.blocker.reason = 'The Elements release slipped to the next quarter.';
-  const report = { blockerChanged: true };
-  await (await executor(jira, tickets)).exec.holdWithReason(first, { key: 'LIB-45', onHold: true, ownership }, report);
-  await (
-    await executor(jira, tickets, { runId: 'week-5' })
-  ).exec.holdWithReason(updated, { key: 'LIB-45', onHold: true, ownership }, { blockerChanged: true });
-  const texts = jira.issues.get('LIB-45').comments.map((comment) => JSON.stringify(comment));
-  assert.equal(texts.filter((text) => text.includes('Reason for On Hold')).length, 2);
-  assert.ok(texts.some((text) => text.includes('slipped to the next quarter')));
-});
-
 test('a severity raised again after a manual reset is explained again', async () => {
   const tickets = registerTickets();
   const jira = new FakeJira(tickets);
@@ -2193,27 +2153,6 @@ test('recovery gives up an entry whose ticket is gone and still recovers the oth
   assert.equal(reloaded.find(gone).status, 'abandoned');
   assert.equal(reloaded.find(link).status, 'not-applied');
   assert.ok(outcome.warnings.some((warning) => warning.code === 'abandoned'));
-});
-
-test('a re-run that plans a different blocker posts the new reason before ownership', async () => {
-  const tickets = registerTickets();
-  const jira = new FakeJira(tickets);
-  jira.issues.get('LIB-24').fields.status = { name: 'Open', statusCategory: { key: 'new' } };
-  const first = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-24', 'low', [101], {
-    ...blocked('no-upstream-patch', 'https://github.com/advisories/GHSA-0000-0000-0007'),
-  });
-  const replanned = group(`${EL}:pkg-merge`, EL, 'keep', 'LIB-24', 'low', [101], {
-    ...blocked('upstream-release-pending', 'LIB-44'),
-  });
-  // This automation puts the ticket On Hold, then a re-run of the same run plans a different blocker.
-  await (
-    await executor(jira, tickets)
-  ).exec.holdWithReason(first, { key: 'LIB-24', onHold: false, ownership: null }, {});
-  await (
-    await executor(jira, tickets)
-  ).exec.holdWithReason(replanned, { key: 'LIB-24', onHold: true, ownership: null }, {});
-  const texts = jira.issues.get('LIB-24').comments.map((comment) => JSON.stringify(comment));
-  assert.equal(texts.filter((text) => text.includes('Reason for On Hold')).length, 2);
 });
 
 test('adopting a ticket a person already put On Hold records the blocker without another reason comment', async () => {
@@ -2352,4 +2291,72 @@ test('an incomplete scan never claims there were no new findings', () => {
   const text = JSON.stringify(card);
   assert.match(text, /scan incomplete/);
   assert.doesNotMatch(text, /No new untriaged|open alert\(s\)/);
+});
+
+// "Reason for On Hold" is posted once, when this automation creates the ticket.
+
+test('only a created ticket gets a "Reason for On Hold", and only once', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const unpatched = group(`${EL}:pkg-merge`, EL, 'create', undefined, 'low', [106], {
+    ...blocked('no-upstream-patch', 'https://github.com/advisories/GHSA-0000-0000-0007'),
+  });
+  const report = {};
+  await (await executor(jira, tickets)).exec.create(unpatched, report);
+  // A re-run of the same run reuses the ticket and posts nothing more.
+  await (await executor(jira, tickets)).exec.create(unpatched, {});
+  const key = report.ticketKey;
+  const reasons = jira.issues
+    .get(key)
+    .comments.filter((comment) => JSON.stringify(comment).includes('Reason for On Hold'));
+  assert.equal(jira.issues.get(key).fields.status.name, 'On Hold');
+  assert.equal(reasons.length, 1);
+});
+
+test('later changes to a held ticket add no new reason: new alerts, a changed blocker or an updated reason', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const ownership = { kind: 'blocked', blocker: { type: 'no-upstream-patch', upstreamRef: 'https://example/old' } };
+  const changed = group(`${EL}:pkg-merge`, EL, 'extend', 'LIB-45', 'low', [106], {
+    ...blocked('upstream-release-pending', 'LIB-24'),
+    updateNote: 'The fix now waits for an Elements release.',
+  });
+  const { exec } = await executor(jira, tickets);
+  const done = await exec.holdWithReason(changed, { key: 'LIB-45', onHold: true, ownership }, { blockerChanged: true });
+  assert.equal(done, true);
+  assert.equal(jira.issues.get('LIB-45').comments.length, 0);
+});
+
+test('an adopted ticket put On Hold by this automation gets no reason comment', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  jira.issues.get('LIB-24').fields.status = { name: 'Open', statusCategory: { key: 'new' } };
+  const adopt = group(`${EL}:refresh`, EL, 'adopt', 'LIB-24', 'medium', [101], {
+    ...blocked('no-upstream-patch', 'https://github.com/advisories/GHSA-0000-0000-0007'),
+  });
+  const { exec, control } = await executor(jira, tickets);
+  const done = await exec.holdWithReason(adopt, { key: 'LIB-24', onHold: false, ownership: null }, {});
+  assert.equal(done, true);
+  assert.equal(jira.issues.get('LIB-24').fields.status.name, 'On Hold');
+  assert.equal(jira.issues.get('LIB-24').comments.length, 0);
+  // Its hold step owes no reason to later runs either.
+  const hold = control.journal.entries.find((entry) => entry.kind === 'hold');
+  assert.equal(hold.recovery.blocker, undefined);
+});
+
+test('an adoption whose ownership is not recorded is not reported as adopted', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  const setProperty = jira.setProperty.bind(jira);
+  jira.setProperty = async (key, name, value) => {
+    if (name === OWNERSHIP_PROPERTY) {
+      throw Object.assign(new Error('HTTP 400'), { status: 400 });
+    }
+    return setProperty(key, name, value);
+  };
+  const { exec } = await executor(jira, tickets);
+  const report = { action: 'proposed adopt' };
+  await exec.update(group(`${EL}:refresh`, EL, 'adopt', 'LIB-44', 'high', [104, 105, 107]), report);
+  assert.equal(report.action, 'proposed adopt');
+  assert.equal(jira.issues.get('LIB-44').properties[OWNERSHIP_PROPERTY], undefined);
 });
