@@ -8,19 +8,10 @@ export function commentMarker(...parts) {
   return `dat-${shortHash(parts)}`;
 }
 
-// A blocker reason is identified by everything it says, so an updated reason, mitigation or recheck is posted.
-export const holdMarker = (key, blocker) =>
-  commentMarker(
-    'hold',
-    key,
-    blocker?.type,
-    blocker?.upstreamRef ?? null,
-    blocker?.reason,
-    blocker?.mitigation,
-    blocker?.recheck,
-  );
+// A ticket gets one "Reason for On Hold", when this automation creates it On Hold; later changes add none.
+export const holdMarker = (key) => commentMarker('hold', key);
 
-export const holdCommentId = (runId, key, blocker) => `${runId}:${key}:hold-comment:${holdMarker(key, blocker)}`;
+export const holdCommentId = (runId, key) => `${runId}:${key}:hold-comment`;
 
 export const STATE_PROPERTY = 'dependabot-ai-triage-state';
 export const JOURNAL_PROPERTY = 'dependabot-ai-triage-journal';
@@ -67,7 +58,7 @@ export function followUps(entry) {
   }
   if (entry.kind === 'hold' && entry.recovery?.blocker) {
     items.push({
-      id: holdCommentId(entry.runId, key, entry.recovery.blocker),
+      id: holdCommentId(entry.runId, key),
       kind: 'hold-comment',
       key,
       blocker: entry.recovery.blocker,

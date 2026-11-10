@@ -358,22 +358,22 @@ export class Executor {
   }
 
   /**
-   * Puts blocked work On Hold with its reason. A reason is posted only when this automation puts the ticket On Hold,
-   * or when a ticket it already owns as blocked gets a different blocker (type, upstream reference, or an update the
-   * planner reported). A ticket a person already put On Hold carries that person's reason: adopting it only records
-   * the blocker in the ownership property. If a run stops after its own transition, the hold step still owes its
-   * reason through the journal, so it is posted later.
+   * Puts blocked work On Hold. The "Reason for On Hold" comment is posted once, when this automation creates the
+   * ticket; adopting, extending or re-planning a ticket only records the blocker in its ownership property. If a run
+   * stops after creating and holding a ticket, the hold step still owes that reason through the journal.
    */
   async holdWithReason(group, target, report) {
     const { runId } = this.inventory;
+    const created = group.operation === 'create';
     const holdNow = !target.onHold;
     if (holdNow) {
-      // The blocker travels with the reservation, so a reason a stopped run never posted is still posted later.
+      // For a created ticket the blocker travels with the reservation, so a reason a stopped run never posted is
+      // still posted later; other holds owe no reason.
       const hold = this.withRecovery(
         async () => {
           return { key: target.key, held: await this.hold(target.key, group) };
         },
-        { key: target.key, blocker: group.blocker },
+        { key: target.key, ...(created ? { blocker: group.blocker } : {}) },
       );
       const held = await this.act(`${runId}:${target.key}:hold`, 'hold', target.key, hold);
       report.heldVerified = Boolean(held?.held);
@@ -381,17 +381,8 @@ export class Executor {
         return false;
       }
     }
-    const recorded = target.ownership?.kind === 'blocked' ? target.ownership.blocker : null;
-    const blockerMoved =
-      Boolean(recorded) &&
-      (recorded.type !== group.blocker?.type || recorded.upstreamRef !== group.blocker?.upstreamRef);
-    // The journal shows whether this automation put the ticket On Hold (in this or an earlier run).
-    const heldHere = this.control.journal.entries.some(
-      (entry) => entry.kind === 'hold' && entry.status === 'done' && entry.recovery?.key === target.key,
-    );
-    if (holdNow || heldHere || blockerMoved || (recorded && report.blockerChanged)) {
-      // The id names the blocker too: a re-run that plans a different reason writes that reason.
-      const id = holdCommentId(runId, target.key, group.blocker);
+    if (created) {
+      const id = holdCommentId(runId, target.key);
       if (!(await this.act(id, 'hold-comment', target.key, this.holdCommentAction(target.key, group.blocker)))) {
         if (this.control.find(id)?.status === 'failed') {
           this.pendingWrites.push({ id, kind: 'hold-comment', key: target.key, blocker: group.blocker });
@@ -404,9 +395,9 @@ export class Executor {
     return true;
   }
 
-  /** The "Reason for On Hold" comment for a blocker. */
+  /** The "Reason for On Hold" comment of a created ticket; its marker allows one per ticket. */
   holdCommentAction(key, blocker) {
-    const marker = holdMarker(key, blocker);
+    const marker = holdMarker(key);
     return this.withRecovery(
       async () => {
         await this.commentOnce(key, marker, holdComment({ group: { blocker }, runId: this.inventory.runId, marker }));
@@ -806,10 +797,12 @@ export class Executor {
     const keepAction = group.updateNote ? 'kept-updated' : 'kept';
     Object.assign(report, {
       ticketKey: group.ticket,
-      action: { extend: 'extended', adopt: 'adopted', keep: keepAction }[group.operation],
       blockerChanged: group.kind === 'blocked' && (group.operation === 'extend' || Boolean(group.updateNote)),
     });
-    await this.finish(group, target, alerts, report);
+    // Reported as done only once ownership is recorded; until then it stays proposed and its failure is reported.
+    if (await this.finish(group, target, alerts, report)) {
+      report.action = { extend: 'extended', adopt: 'adopted', keep: keepAction }[group.operation];
+    }
   }
 
   async raiseCovered(raise, plannedTickets) {
