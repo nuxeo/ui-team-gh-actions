@@ -106,7 +106,7 @@ the variables were not updated, the run still reconciles and reports, but refuse
   while the planner ran is never duplicated. Label and severity changes, the scope comment, the "severity raised"
   comment, the On Hold transition and its reason comment are separate journal steps, so a retry repeats only the
   unfinished ones. Links to related tickets are made before ownership is recorded; a link or "severity raised"
-  comment that fails is kept in the run state and retried by later runs, and the ticket's ownership waits for it.
+  comment that fails is kept in the run state and in the journal, and retried by later runs until it succeeds, and the ticket's ownership waits for it.
   The ownership property is written **last**, after the scope, severity and On Hold changes are verified, so an
   interrupted run leaves those alerts unowned and they are simply planned again. A write whose outcome is unknown
   (timeout, 5xx) stops further writes and is never blindly repeated; the next automatic run reconciles it from Jira

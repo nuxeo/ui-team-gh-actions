@@ -408,7 +408,11 @@ function checkReports(ctx) {
   for (const [index, item] of ctx.plan.closedTicketMismatches.entries()) {
     const where = `closedTicketMismatches[${index}]`;
     const ticket = isObject(item) && typeof item.ticket === 'string' ? ctx.tickets.get(item.ticket) : null;
-    const valid = validReportTarget(ctx, item) && !unknownKeys(item, MISMATCH_KEYS).length;
+    const valid =
+      isObject(item) &&
+      typeof item.ticket === 'string' &&
+      validReportTarget(ctx, item) &&
+      !unknownKeys(item, MISMATCH_KEYS).length;
     // The closed ticket must belong to the alert's own Jira project, as for groups.
     const sameProject = valid && item.ticket.startsWith(`${ctx.projectOf.get(item.repository)}-`);
     if (!valid || !sameProject || ticket?.statusCategory !== 'done') {

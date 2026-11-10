@@ -1765,3 +1765,66 @@ test('the default configuration is the reviewed config.json beside the scripts',
     ['nuxeo/nuxeo-web-ui', 'nuxeo/nuxeo-elements'],
   );
 });
+
+// Review round on nuxeo/ui-team-gh-actions#7.
+
+test('a closed-ticket mismatch without a string ticket is a schema error, not a crash', () => {
+  const alerts = liveAlerts();
+  for (const ticket of [undefined, null, 77]) {
+    const planned = bootstrapPlan();
+    planned.groups.pop();
+    planned.closedTicketMismatches.push({ repository: EL, alert: 108, ticket });
+    const result = validatePlan({
+      plan: planned,
+      runId: RUN,
+      inventoryDigest: DIGEST,
+      repositories: [
+        { name: WEB, project: 'APP' },
+        { name: EL, project: 'LIB' },
+      ],
+      epicQuarter: '2026-Q4',
+      alerts,
+      aiInput: alerts.map((alert) => `${alert.repository}#${alert.number}`),
+      currentOwner: new Map(),
+      tickets: registerTickets(),
+      now: new Date('2026-11-09T07:45:00Z'),
+    });
+    assert.ok(result.errors.some((error) => error.code === 'mismatch-schema'));
+  }
+});
+
+test('a recovered severity raise is explained with the original severity and its driving alerts', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  jira.issues.get('LIB-44').fields[config.severityField] = { id: severityId('medium') };
+  jira.failNext = { name: 'edit', error: { uncertain: true } };
+  const extend = group(`${EL}:refresh`, EL, 'extend', 'LIB-44', 'high', [104, 105, 107], { updateNote: 'x' });
+  const first = await executor(jira, tickets);
+  await first.exec.update(extend, {});
+  const entry = first.control.journal.entries.find((item) => item.kind === 'extend');
+  assert.equal(entry.status, 'uncertain');
+  assert.equal(entry.recovery.raise.from, 'medium');
+  assert.deepEqual(entry.recovery.raise.alerts, ['#107']);
+  jira.issues.get('LIB-44').fields[config.severityField] = { id: severityId('high') };
+  const retry = await executor(jira, tickets);
+  await retry.exec.recover();
+  const queued = retry.exec.pendingWrites.find((item) => item.kind === 'severity-comment');
+  assert.deepEqual(queued.raise, entry.recovery.raise);
+});
+
+test('a failed link is replayed from the journal even when its retry queue was never saved', async () => {
+  const tickets = registerTickets();
+  const jira = new FakeJira(tickets);
+  jira.issues.set('LIB-700', { key: 'LIB-700', fields: { labels: [], issuelinks: [] }, properties: {}, comments: [] });
+  const control = new ControlState(jira, config.controlIssue);
+  await control.load();
+  const id = 'old:LIB-700:link:LIB-44';
+  await control.reserve({ id, kind: 'link', target: 'x', runId: 'old', recovery: { from: 'LIB-700', to: 'LIB-44' } });
+  await control.settle(id, 'failed', { message: 'HTTP 503' });
+  assert.equal(control.prunable(control.find(id)), false);
+  const { exec } = await executor(jira, tickets);
+  await exec.recover();
+  assert.deepEqual(exec.pendingWrites, [{ id, from: 'LIB-700', to: 'LIB-44' }]);
+  assert.deepEqual(await exec.replayPending(exec.pendingWrites), []);
+  assert.ok(jira.calls.some((call) => call.name === 'link'));
+});
