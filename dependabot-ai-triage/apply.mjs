@@ -679,17 +679,18 @@ export class Executor {
     const signature = this.signature(group, { ticket: group.ticket });
     const id = `${runId}:${group.remediationId}:${group.operation}:${signature}`;
     const raiseTo = SEVERITY_RANK[group.severity] > (SEVERITY_RANK[target.severity] ?? 0) ? group.severity : null;
+    const priorityTo = this.priorityRaise(group.severity, target.priority);
+    // Recorded before the edit, so a recovered raise is explained with the real values and driving alerts.
+    const drivers = alerts.filter((alert) => alert.severity === group.severity).map((alert) => `#${alert.number}`);
+    const priorityChange = priorityTo ? { priority: { from: target.priority, to: priorityTo } } : {};
+    const raise = raiseTo ? { from: target.severity ?? null, to: raiseTo, alerts: drivers, ...priorityChange } : null;
     // A retry of this run reuses the recorded result, so the severity change is still explained even though Jira
     // now shows the raised value.
     const scope = await this.act(
       id,
       group.operation,
       group.ticket,
-      this.withRecovery(() => this.applyScope(group, target), {
-        key: group.ticket,
-        raiseTo,
-        priorityTo: this.priorityRaise(group.severity, target.priority),
-      }),
+      this.withRecovery(() => this.applyScope(group, target), { key: group.ticket, raiseTo, priorityTo, raise }),
       signature,
     );
     if (!scope) {
@@ -852,8 +853,19 @@ export class Executor {
   }
 
   /** Reconciles reservations left by an interrupted run before anything new is written. */
-  recover() {
-    return mapSequential(this.control.pending(), (entry) => this.recoverEntry(entry));
+  async recover() {
+    await mapSequential(this.control.pending(), (entry) => this.recoverEntry(entry));
+    // Links and severity comments that definitely did not happen are replayed from the journal itself, so one
+    // whose retry queue was never saved (the job stopped first) is still written.
+    const queued = new Set(this.pendingWrites.map((item) => item.id));
+    for (const entry of this.control.retryable().filter((item) => !queued.has(item.id))) {
+      const { recovery } = entry;
+      this.pendingWrites.push(
+        entry.kind === 'link'
+          ? { id: entry.id, from: recovery.from, to: recovery.to }
+          : { id: entry.id, kind: entry.kind, key: recovery.key, raise: recovery.raise },
+      );
+    }
   }
 
   async execute(plan) {

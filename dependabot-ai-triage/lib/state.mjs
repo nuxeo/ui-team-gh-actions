@@ -13,6 +13,9 @@ const RETRY_WINDOW_MS = 30 * 864e5;
 const LOCK_STALE_HOURS = 6;
 const JOURNAL_BUDGET = 28000;
 const RESOLVED = new Set(['done', 'failed', 'not-applied']);
+// Writes that must eventually happen: while they definitely did not, they are replayed and never pruned.
+const RETRIED = new Set(['link', 'severity-comment']);
+const retryPending = (entry) => RETRIED.has(entry.kind) && ['failed', 'not-applied'].includes(entry.status);
 
 export class LockHeldError extends Error {}
 
@@ -154,6 +157,11 @@ export class ControlState {
     );
   }
 
+  /** Links and severity comments that definitely did not happen yet; replayed under their own ids until done. */
+  retryable() {
+    return this.journal.entries.filter((entry) => retryPending(entry) && entry.recovery);
+  }
+
   /** Closure history: an index property names how many shard properties hold the ranges. */
   async loadCleared() {
     const index = await this.jira.property(this.issueKey, CLEARED_PROPERTY);
@@ -216,7 +224,7 @@ export class ControlState {
 
   /** Resolved entries may go, except Teams delivery records that a re-run of their workflow run still needs. */
   prunable(entry, now = Date.now()) {
-    if (!RESOLVED.has(entry.status)) {
+    if (!RESOLVED.has(entry.status) || retryPending(entry)) {
       return false;
     }
     return entry.kind !== 'teams' || now - Date.parse(entry.settledAt ?? entry.at ?? 0) > RETRY_WINDOW_MS;
