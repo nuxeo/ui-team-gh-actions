@@ -52,6 +52,13 @@ test('bootstrap: adopting the existing register and creating one library ticket 
   assert.deepEqual(result.errors, []);
 });
 
+test('teamsLine is no longer required, and a plan that still sends it is accepted', () => {
+  const plan = bootstrapPlan();
+  assert.ok(plan.groups.some((item) => item.operation === 'create' && item.teamsLine === undefined));
+  plan.groups.find((item) => item.operation === 'create').teamsLine = 'Legacy one-liner.';
+  assert.deepEqual(validatePlan(bootstrapArgs(plan)).errors, []);
+});
+
 test('a library alert cannot be folded into an app ticket for the same package', () => {
   const plan = bootstrapPlan();
   plan.groups.pop();

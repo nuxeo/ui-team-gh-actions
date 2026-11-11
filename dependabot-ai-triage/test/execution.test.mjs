@@ -279,6 +279,27 @@ test('Teams: High findings are highlighted, created tickets listed, FYI only aft
   );
 });
 
+test('Teams: created and updated tickets are listed by heading only, without a summary line', () => {
+  const created = {
+    ...createGroup(),
+    ticketKey: 'LIB-3000',
+    action: 'created',
+    teamsLine: 'Planner summary that must not appear.',
+  };
+  const extended = {
+    ...group(`${EL}:refresh`, EL, 'extend', 'LIB-44', 'medium', [104], { updateNote: 'Update note not shown.' }),
+    ticketKey: 'LIB-44',
+    action: 'extended',
+  };
+  const lines = teamsCard(baseOutcome({ newBySeverity: { medium: 1 }, groups: [created, extended] }), teamsConfig)
+    .attachments[0].content.body.map((item) => item.text);
+  const after = (heading) => lines[lines.findIndex((line) => line.startsWith(heading)) + 1];
+  assert.ok(lines.includes('**[LIB-3000](https://jira.example/browse/LIB-3000) · Medium · lib**'));
+  assert.ok(lines.includes('**[LIB-44](https://jira.example/browse/LIB-44) · Medium · lib**'));
+  assert.match(after('**[LIB-3000]'), /^\*\*Tickets updated · 1\*\*$/);
+  assert.doesNotMatch(JSON.stringify(lines), /Planner summary|Update note not shown/);
+});
+
 test('Teams: the attention line names only nonzero Critical/High counts', () => {
   assert.equal(attentionText({ high: 1 }), '1 High finding needs attention.');
   assert.equal(attentionText({ critical: 1 }), '1 Critical finding needs attention.');

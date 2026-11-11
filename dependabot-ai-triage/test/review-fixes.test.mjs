@@ -1626,13 +1626,19 @@ test('a workspace package.json alert is analysed from the root lockfile', async 
 });
 
 test('a large Teams card is trimmed to its byte budget and points to the full report', () => {
+  const long = '€'.repeat(2000);
   const groups = Array.from({ length: 15 }, (_, index) => {
     return {
       ...group(`${EL}:big-${index}`, EL, 'create', undefined, 'high', [index]),
       action: 'created',
       ticketKey: `LIB-${index}`,
-      teamsLine: '€'.repeat(2000),
+      kind: 'blocked',
+      blockerChanged: true,
+      blocker: { reason: long, recheck: long },
     };
+  });
+  const needsReview = Array.from({ length: 15 }, (_, index) => {
+    return { repository: EL, alert: index, candidateTicket: 'LIB-1', missingEvidence: long };
   });
   const card = teamsCard(
     {
@@ -1642,7 +1648,7 @@ test('a large Teams card is trimmed to its byte budget and points to the full re
       newBySeverity: { high: 15 },
       groups,
       severityRaises: [],
-      needsReview: [],
+      needsReview,
       closedMismatches: [],
       repositories: [{ name: WEB }, { name: EL }],
     },
