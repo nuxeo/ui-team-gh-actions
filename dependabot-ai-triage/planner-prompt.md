@@ -132,7 +132,6 @@ Write plain, specific English for engineers. No marketing language.
   and the validation required (lockfile diff limited to the intended packages, unit tests and CI green, and any
   compatibility checks).
 - `updateNote` (extend, optional for keep): what changed in this ticket's scope and why.
-- `teamsLine` (create, extend): one line of at most 200 characters for the Teams summary.
 - Do not mention alerts that the group does not own.
 
 ## Output
@@ -157,7 +156,6 @@ Respond with only one JSON object, no Markdown fences and no other text:
       "remediation": "...",
       "rationale": "...",
       "acceptanceCriteria": ["..."],
-      "teamsLine": "...",
       "updateNote": "...",
       "blocker": { "type": "no-upstream-patch | upstream-release-pending", "reason": "...", "upstreamRef": "...",
                    "mitigation": "...", "recheck": "..." },

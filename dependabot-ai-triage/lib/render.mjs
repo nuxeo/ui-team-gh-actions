@@ -373,15 +373,12 @@ function ticketSections(outcome, config, controlUrl) {
   const updated = outcome.groups.filter((group) => group.action === 'extended' || group.action === 'kept-updated');
   const updatedKeys = new Set(updated.map((group) => group.ticketKey));
   const raised = outcome.severityRaises.filter((raise) => raise.applied && !updatedKeys.has(raise.ticket));
-  const entry = (group, line) => [
-    ticketHeading(config, group.ticketKey, group.severity, shortRepo(group.repository)),
-    block(line, { spacing: 'None' }),
-  ];
+  const entry = (group) => [ticketHeading(config, group.ticketKey, group.severity, shortRepo(group.repository))];
   const blocks = [];
   if (created.length) {
     blocks.push(
       block(`**Tickets created · ${created.length}**`, { separator: true }),
-      ...limited(created, (group) => entry(group, group.teamsLine), controlUrl),
+      ...limited(created, entry, controlUrl),
     );
   }
   const adopted = outcome.groups.filter((group) => group.action === 'adopted');
@@ -398,7 +395,7 @@ function ticketSections(outcome, config, controlUrl) {
   if (updated.length || raised.length) {
     blocks.push(
       block(`**Tickets updated · ${updated.length + raised.length}**`, { separator: true }),
-      ...limited(updated, (group) => entry(group, group.teamsLine ?? group.updateNote), controlUrl),
+      ...limited(updated, entry, controlUrl),
       ...raised.map((raise) =>
         block(
           `**[${raise.ticket}](${browse(config.jiraSite, raise.ticket)})** · severity raised to ${titleCase(raise.to)}`,

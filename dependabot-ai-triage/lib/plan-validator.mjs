@@ -9,7 +9,6 @@ const KINDS = new Set(['actionable', 'blocked']);
 // A required major upgrade or compatibility work is engineering effort, never an external blocker.
 const BLOCKER_TYPES = new Set(['no-upstream-patch', 'upstream-release-pending']);
 const MAX_TEXT = 4000;
-const MAX_TEAMS_LINE = 300;
 const REMEDIATION_ID = /^[a-z0-9-]+\/[a-z0-9-]+:[a-z0-9][a-z0-9.-]{1,80}$/;
 const JIRA_KEY = /^[A-Z][A-Z0-9]+-\d+$/;
 
@@ -33,6 +32,7 @@ const GROUP_KEYS = new Set([
   'remediation',
   'rationale',
   'acceptanceCriteria',
+  // No longer requested from the planner; still accepted (and ignored) so an older-style plan is not rejected.
   'teamsLine',
   'updateNote',
   'blocker',
@@ -43,8 +43,8 @@ const REVIEW_KEYS = new Set(['repository', 'alert', 'candidateTicket', 'missingE
 const MISMATCH_KEYS = new Set(['repository', 'alert', 'ticket']);
 const OPTIONAL_TEXT = ['summary', 'remediation', 'rationale', 'updateNote'];
 const REQUIRED_TEXT = {
-  create: ['summary', 'remediation', 'rationale', 'teamsLine'],
-  extend: ['rationale', 'updateNote', 'teamsLine'],
+  create: ['summary', 'remediation', 'rationale'],
+  extend: ['rationale', 'updateNote'],
   adopt: ['rationale'],
   keep: ['rationale'],
 };
@@ -114,9 +114,6 @@ function checkFields(ctx, group, where) {
   // Optional text that is supplied must still be valid text: it may be written to Jira.
   for (const field of OPTIONAL_TEXT.filter((name) => group[name] !== undefined && !isText(group[name]))) {
     fail('group-schema', `${where} "${field}" must be non-empty text.`);
-  }
-  if (group.teamsLine !== undefined && !isText(group.teamsLine, MAX_TEAMS_LINE)) {
-    fail('group-schema', `${where} teamsLine must be at most ${MAX_TEAMS_LINE} characters.`);
   }
   const criteria = group.acceptanceCriteria;
   const validCriteria = Array.isArray(criteria) && criteria.length > 0 && criteria.every((item) => isText(item));
@@ -348,7 +345,7 @@ function checkText(ctx, group, owned, where) {
   if (group.operation !== 'create' && group.operation !== 'extend') {
     return;
   }
-  const text = ['summary', 'remediation', 'updateNote', 'teamsLine']
+  const text = ['summary', 'remediation', 'updateNote']
     .map((field) => group[field] ?? '')
     .concat(group.acceptanceCriteria ?? [])
     .join('\n');

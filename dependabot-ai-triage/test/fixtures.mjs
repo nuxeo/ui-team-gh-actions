@@ -109,7 +109,6 @@ export function group(remediationId, repository, operation, ticket, severity, al
     remediation: text('Remediation'),
     rationale: text('Rationale'),
     acceptanceCriteria: ['Alerts close on develop-2025 and develop-2023.'],
-    teamsLine: 'One-line remediation.',
     ...extra,
   };
 }
