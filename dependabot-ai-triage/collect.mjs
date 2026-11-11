@@ -21,7 +21,17 @@ import {
 } from './lib/util.mjs';
 
 export const CONTROL_LABEL = 'dependabot-ai-triage-control';
-const TICKET_FIELDS = ['summary', 'status', 'labels', 'components', 'parent', 'issuelinks', 'description', 'updated'];
+const TICKET_FIELDS = [
+  'summary',
+  'status',
+  'labels',
+  'components',
+  'parent',
+  'issuelinks',
+  'description',
+  'updated',
+  'created',
+];
 
 class PhaseError extends Error {}
 
@@ -60,6 +70,7 @@ export function toTicket(issue, config) {
     labels: fields.labels ?? [],
     parent: fields.parent?.key,
     updated: fields.updated,
+    created: fields.created,
     description: textOf(fields.description),
     links: (fields.issuelinks ?? []).map(linkSummary),
     ownership: issue.properties?.[OWNERSHIP_PROPERTY] ?? null,

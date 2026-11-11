@@ -33,7 +33,8 @@ import {
 import { analyzeLockfile, parseDeclaration } from '../lib/lockfile.mjs';
 import { plan } from '../plan.mjs';
 import { DIGEST, EL, RUN, WEB, blocked, bootstrapPlan, group, liveAlerts, registerTickets } from './fixtures.mjs';
-import { FakeJira, config, createGroup, executor, newOutcome, severityId } from './support.mjs';
+import { FakeJira, cardTables, config, createGroup, executor, newOutcome, severityId } from './support.mjs';
+import { localDate } from '../lib/due.mjs';
 
 const here = path.dirname(new URL(import.meta.url).pathname);
 
@@ -136,12 +137,15 @@ test('a planned update that raises severity is reported as an applied raise', as
   const jira = new FakeJira(tickets);
   const alerts = liveAlerts();
   alerts.find((alert) => alert.number === 14).severity = 'high';
-  const { exec, outcome } = await executor(jira, tickets, { alerts });
+  const { exec, outcome, control } = await executor(jira, tickets, { alerts });
   const adopt = { ...bootstrapPlan().groups[0], severity: 'high' };
   await exec.update(adopt, {});
+  // Entering High starts the fix deadline today, saved in the run state at once.
+  const today = localDate(new Date(), config.timezone);
   assert.deepEqual(outcome.severityRaises, [
-    { ticket: 'APP-31', from: 'medium', to: 'high', alerts: [`${WEB}#14`], applied: true },
+    { ticket: 'APP-31', from: 'medium', to: 'high', alerts: [`${WEB}#14`], applied: true, dueFrom: today },
   ]);
+  assert.equal(control.state.dueFrom['APP-31'], today);
 });
 
 test('issue links go through the journal and are not repeated when the run is retried', async () => {
@@ -603,10 +607,17 @@ test('Teams lists a ticket once when its update also raised severity, and says O
     closedMismatches: [],
     repositories: [{ name: EL }],
   };
-  const text = JSON.stringify(teamsCard(outcome, { ...config, controlIssue: 'APP-99' }));
+  const card = teamsCard(outcome, { ...config, controlIssue: 'APP-99' });
+  const text = JSON.stringify(card);
   assert.match(text, /Tickets updated · 1/);
   assert.equal((text.match(/LIB-44\]/g) ?? []).length, 1);
-  assert.match(text, /LIB-3001\]\([^)]*\) · Low · Blocked, not On Hold/);
+  const tables = cardTables(card);
+  assert.deepEqual(tables['Tickets updated'], [
+    ['[LIB-44](https://jira.example/browse/LIB-44)', 'High', 'Scope extended · Severity raised from Medium'],
+  ]);
+  assert.deepEqual(tables['Tickets created'], [
+    ['[LIB-3001](https://jira.example/browse/LIB-3001)', 'Low', 'Blocked, not On Hold (no patch)'],
+  ]);
 });
 
 test('an unreadable response to a write is an uncertain outcome', async () => {
@@ -1625,38 +1636,61 @@ test('a workspace package.json alert is analysed from the root lockfile', async 
   assert.equal((await branchEvidence(readJson, alert, 'sha')).kind, 'manifest');
 });
 
-test('a large Teams card is trimmed to its byte budget and points to the full report', () => {
+test('a large Teams card is trimmed to its byte budget, keeps the open Critical/High list and points to the report', () => {
   const long = '€'.repeat(2000);
   const groups = Array.from({ length: 15 }, (_, index) => {
     return {
       ...group(`${EL}:big-${index}`, EL, 'create', undefined, 'high', [index]),
       action: 'created',
       ticketKey: `LIB-${index}`,
-      kind: 'blocked',
-      blockerChanged: true,
-      blocker: { reason: long, recheck: long },
     };
   });
   const needsReview = Array.from({ length: 15 }, (_, index) => {
     return { repository: EL, alert: index, candidateTicket: 'LIB-1', missingEvidence: long };
   });
+  const rows = Array.from({ length: 12 }, (_, index) => {
+    return {
+      key: `LIB-${index}`,
+      severity: 'high',
+      status: 'Open',
+      dueFrom: '2026-11-11',
+      dueDate: '2026-11-26',
+      daysLeft: 15,
+    };
+  });
   const card = teamsCard(
     {
       runId: RUN,
-      complete: true,
-      failures: [],
+      complete: false,
+      failures: Array.from({ length: 10 }, () => long),
       newBySeverity: { high: 15 },
       groups,
       severityRaises: [],
       needsReview,
       closedMismatches: [],
       repositories: [{ name: WEB }, { name: EL }],
+      openHigh: { available: true, rows },
     },
     { ...config, controlIssue: 'APP-99' },
   );
-  assert.ok(Buffer.byteLength(JSON.stringify(card), 'utf8') <= 24000);
-  assert.match(JSON.stringify(card), /more line\(s\) are in the \[full report\]/);
-  assert.match(JSON.stringify(card), /Run ID/);
+  const text = JSON.stringify(card);
+  assert.ok(Buffer.byteLength(text, 'utf8') <= 24000);
+  assert.match(text, /more section\(s\) are in the \[full report\]/);
+  assert.match(text, /Run ID/);
+  // Sections are dropped whole: every table keeps its title, and no title is left without its table.
+  const body = card.attachments[0].content.body;
+  body.forEach((item, index) => {
+    if (item.type === 'Table') {
+      assert.match(body[index - 1].text, /^\*\*[^*]+ · \d+\*\*$/);
+    }
+    if (/^\*\*(Tickets created|Tickets updated|Open Critical \/ High tickets) · /.test(item.text ?? '')) {
+      assert.equal(body[index + 1].type, 'Table');
+    }
+  });
+  // Trimming removes detail sections, never the open Critical/High list.
+  assert.equal(cardTables(card)['Open Critical / High tickets'].length, 10);
+  assert.match(text, /\+2 more in the \[full report\]/);
+  assert.equal(cardTables(card)['Tickets created'].length, 10);
 });
 
 test('writes queued before a later group throws are still saved', async () => {
@@ -2259,17 +2293,20 @@ test('the Teams card always states the findings result, even when tickets change
     needsReview: [],
     closedMismatches: [],
     repositories: [{ name: WEB }, { name: EL }],
+    openHigh: { available: true, rows: [] },
   };
-  const lines = teamsCard(outcome, { ...config, controlIssue: 'APP-99' }).attachments[0].content.body.map(
-    (item) => item.text,
-  );
+  const card = teamsCard(outcome, { ...config, controlIssue: 'APP-99' });
+  const lines = card.attachments[0].content.body.map((item) => item.text);
   const text = lines.join('\n');
   assert.match(text, /No new untriaged Dependabot findings were identified\./);
   assert.match(text, /24 open alert\(s\) · 0 already tracked on tickets before this run/);
-  assert.match(text, /Existing tickets now tracked · 3/);
-  assert.match(text, /LIB-44.*severity raised to Medium/);
-  assert.doesNotMatch(text, /took the day off/);
-  const order = ['No new untriaged', 'open alert(s)', 'now tracked', 'Tickets updated', 'Run ID'].map((part) =>
+  assert.deepEqual(cardTables(card)['Tickets updated'], [
+    ['[LIB-24](https://jira.example/browse/LIB-24)', 'Medium', 'Now tracked'],
+    ['[LIB-44](https://jira.example/browse/LIB-44)', 'Medium', 'Now tracked · Severity set'],
+    ['[LIB-45](https://jira.example/browse/LIB-45)', 'Medium', 'Now tracked'],
+  ]);
+  assert.doesNotMatch(text, /took the day off|Existing tickets now tracked/);
+  const order = ['No new untriaged', 'open alert(s)', 'Tickets updated', 'Open Critical / High', 'Run ID'].map((part) =>
     lines.findIndex((line) => line?.includes(part)),
   );
   assert.deepEqual(
