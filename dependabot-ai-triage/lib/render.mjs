@@ -356,11 +356,7 @@ export function attentionText(bySeverity) {
 function findingBlocks(outcome) {
   const fresh = outcome.newBySeverity;
   const label = outcome.firstReconciliation ? 'Untriaged findings (first reconciliation)' : 'New findings';
-  const blocks = [];
-  if (outcome.complete) {
-    blocks.push(block('🐛 Dependabot found a few uninvited guests in the dependency tree.'));
-  }
-  blocks.push(block(`**${label}:** ${countLine(fresh)}`));
+  const blocks = [block(`**${label}:** ${countLine(fresh)}`)];
   if (!fresh.critical && !fresh.high) {
     return [...blocks, block('No new Critical or High findings.')];
   }
@@ -467,9 +463,6 @@ export function teamsCard(outcome, config, now = new Date()) {
     body.push(...findingBlocks(outcome));
   } else if (outcome.complete) {
     body.push(block('No new untriaged Dependabot findings were identified.'));
-    if (!tickets.length && !review.length) {
-      body.push(block('🐛 The bugs took the day off. We checked anyway.'));
-    }
   }
   if (outcome.complete && outcome.counts) {
     const { alerts, covered } = outcome.counts;
