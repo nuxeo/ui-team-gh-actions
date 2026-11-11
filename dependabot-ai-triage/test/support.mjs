@@ -200,3 +200,16 @@ export async function executor(jira, tickets, overrides) {
 }
 
 export const createGroup = () => group(`${EL}:pkg-match-globparts`, EL, 'create', undefined, 'medium', [108]);
+
+/** Rows (cell texts, header excluded) of each table in a Teams card, keyed by the section title above it. */
+export function cardTables(card) {
+  const body = card.attachments[0].content.body;
+  const tables = {};
+  body.forEach((item, index) => {
+    if (item.type === 'Table') {
+      const title = body[index - 1].text.replaceAll('**', '').split(' · ')[0];
+      tables[title] = item.rows.slice(1).map((row) => row.cells.map((cell) => cell.items[0].text));
+    }
+  });
+  return tables;
+}

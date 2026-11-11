@@ -5,7 +5,7 @@ import { OWNED_LABEL, OWNERSHIP_PROPERTY } from '../lib/reconcile.mjs';
 import { attentionText, reportNeeded, runReport, teamsCard, ticketDescription } from '../lib/render.mjs';
 import { ControlState, JOURNAL_PROPERTY } from '../lib/state.mjs';
 import { RUN, EL, WEB, blocked, bootstrapPlan, group, liveAlerts, registerTickets } from './fixtures.mjs';
-import { FakeJira, config, createGroup, executor, newOutcome, severityId } from './support.mjs';
+import { FakeJira, cardTables, config, createGroup, executor, newOutcome, severityId } from './support.mjs';
 
 test('create: builds the ticket itself, records ownership and verifies severity and epic', async () => {
   const jira = new FakeJira();
@@ -218,18 +218,22 @@ const baseOutcome = (extra = {}) => {
     closedMismatches: [],
     repositories: [{ name: WEB }, { name: EL }],
     firstReconciliation: false,
+    openHigh: { available: true, rows: [] },
     ...extra,
   };
 };
 const teamsConfig = { ...config, controlIssue: 'APP-99' };
 
-test('Teams: clean run uses the agreed wording and no tables', () => {
+test('Teams: clean run uses the agreed wording, with no ticket tables and the empty open Critical/High list', () => {
   const card = teamsCard(baseOutcome(), teamsConfig);
   const textBlocks = cardText(card);
   assert.match(textBlocks, /No new untriaged Dependabot findings were identified\./);
-  assert.doesNotMatch(textBlocks, /🐛|took the day off|uninvited guests/);
+  assert.match(textBlocks, /Open Critical \/ High tickets · 0/);
+  assert.match(textBlocks, /No Critical or High security tickets are in an open state\./);
+  assert.doesNotMatch(textBlocks, /🐛|took the day off|uninvited guests|No new Critical/);
   assert.match(textBlocks, /Run ID: 19000000001/);
   assert.doesNotMatch(JSON.stringify(card), /ColumnSet|"Table"/);
+  assert.equal(card.attachments[0].content.version, '1.5');
 });
 
 test('Teams: incomplete run names failures and makes no clean-scan claim', () => {
@@ -244,7 +248,7 @@ test('Teams: incomplete run names failures and makes no clean-scan claim', () =>
   assert.doesNotMatch(textBlocks, /took the day off|uninvited guests/);
 });
 
-test('Teams: High findings are highlighted, created tickets listed, FYI only after a verified hold', () => {
+test('Teams: High findings are highlighted and created tickets are a table with their status', () => {
   const created = { ...createGroup(), ticketKey: 'LIB-3000', action: 'created', severity: 'high' };
   const held = {
     ...group(
@@ -261,25 +265,27 @@ test('Teams: High findings are highlighted, created tickets listed, FYI only aft
     blockerChanged: true,
     heldVerified: false,
   };
-  const textBlocks = cardText(
-    teamsCard(baseOutcome({ newBySeverity: { high: 1, low: 1 }, groups: [created, held] }), teamsConfig),
-  );
-  assert.match(textBlocks, /No new Critical findings\./);
+  const card = teamsCard(baseOutcome({ newBySeverity: { high: 1, low: 1 }, groups: [created, held] }), teamsConfig);
+  const textBlocks = cardText(card);
   assert.match(textBlocks, /1 High finding needs attention\./);
-  assert.doesNotMatch(textBlocks, /🐛|uninvited guests|took the day off/);
+  assert.doesNotMatch(textBlocks, /No new Critical|🐛|uninvited guests|took the day off/);
   assert.doesNotMatch(textBlocks, /0 Critical and/);
   assert.match(textBlocks, /Tickets created · 2/);
-  assert.match(textBlocks, /\[LIB-3000\]\(https:\/\/jira\.example\/browse\/LIB-3000\) · High · lib/);
-  assert.match(textBlocks, /Blockers \/ no patch available · 1/);
-  assert.doesNotMatch(textBlocks, /FYI/);
-  held.heldVerified = true;
-  assert.match(
-    cardText(teamsCard(baseOutcome({ newBySeverity: { low: 1 }, groups: [held] }), teamsConfig)),
-    /FYI: LIB-3001 was automatically put On Hold\./,
-  );
+  // Blocked tickets are shown once, in the created table, not again in a blockers section.
+  assert.doesNotMatch(textBlocks, /Blockers|FYI/);
+  assert.deepEqual(cardTables(card)['Tickets created'], [
+    ['[LIB-3000](https://jira.example/browse/LIB-3000)', 'High', 'Open'],
+    ['[LIB-3001](https://jira.example/browse/LIB-3001)', 'Low', 'Blocked, not On Hold (no patch)'],
+  ]);
+  held.onHold = true;
+  const heldCard = teamsCard(baseOutcome({ newBySeverity: { low: 1 }, groups: [held] }), teamsConfig);
+  assert.deepEqual(cardTables(heldCard)['Tickets created'], [
+    ['[LIB-3001](https://jira.example/browse/LIB-3001)', 'Low', 'On Hold (no patch)'],
+  ]);
+  assert.doesNotMatch(cardText(heldCard), /needs attention/);
 });
 
-test('Teams: created and updated tickets are listed by heading only, without a summary line', () => {
+test('Teams: created and updated tickets are tables with a short code-written change, no planner text', () => {
   const created = {
     ...createGroup(),
     ticketKey: 'LIB-3000',
@@ -290,14 +296,31 @@ test('Teams: created and updated tickets are listed by heading only, without a s
     ...group(`${EL}:refresh`, EL, 'extend', 'LIB-44', 'medium', [104], { updateNote: 'Update note not shown.' }),
     ticketKey: 'LIB-44',
     action: 'extended',
+    added: 2,
   };
-  const lines = teamsCard(baseOutcome({ newBySeverity: { medium: 1 }, groups: [created, extended] }), teamsConfig)
-    .attachments[0].content.body.map((item) => item.text);
-  const after = (heading) => lines[lines.findIndex((line) => line.startsWith(heading)) + 1];
-  assert.ok(lines.includes('**[LIB-3000](https://jira.example/browse/LIB-3000) · Medium · lib**'));
-  assert.ok(lines.includes('**[LIB-44](https://jira.example/browse/LIB-44) · Medium · lib**'));
-  assert.match(after('**[LIB-3000]'), /^\*\*Tickets updated · 1\*\*$/);
-  assert.doesNotMatch(JSON.stringify(lines), /Planner summary|Update note not shown/);
+  const patched = {
+    ...group(`${EL}:blocked`, EL, 'keep', 'LIB-45', 'low', [105], { updateNote: 'A patch is published.' }),
+    ticketKey: 'LIB-45',
+    action: 'kept-updated',
+    previousKind: 'blocked',
+  };
+  const adopted = {
+    ...group(`${EL}:old`, EL, 'adopt', 'LIB-46', 'low', [107]),
+    ticketKey: 'LIB-46',
+    action: 'adopted',
+  };
+  const card = teamsCard(
+    baseOutcome({ newBySeverity: { medium: 1 }, groups: [created, extended, patched, adopted] }),
+    teamsConfig,
+  );
+  const tables = cardTables(card);
+  assert.deepEqual(tables['Tickets created'], [['[LIB-3000](https://jira.example/browse/LIB-3000)', 'Medium', 'Open']]);
+  assert.deepEqual(tables['Tickets updated'], [
+    ['[LIB-44](https://jira.example/browse/LIB-44)', 'Medium', '2 alerts added'],
+    ['[LIB-45](https://jira.example/browse/LIB-45)', 'Low', 'Patch now available'],
+    ['[LIB-46](https://jira.example/browse/LIB-46)', 'Low', 'Now tracked'],
+  ]);
+  assert.doesNotMatch(JSON.stringify(card), /Planner summary|Update note not shown|A patch is published/);
 });
 
 test('Teams: the attention line names only nonzero Critical/High counts', () => {

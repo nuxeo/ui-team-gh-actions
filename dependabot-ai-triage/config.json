@@ -29,6 +29,7 @@
   ],
   "timezone": "Asia/Kolkata",
   "maxInventoryAgeHours": 3,
+  "dueDays": 15,
   "copilot": { "cliVersion": "1.0.106", "model": "claude-sonnet-5.5", "timeoutMinutes": 20 },
   "teams": {
     "destination": "Nuxeo → WebUI - Collaboration",

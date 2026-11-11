@@ -24,6 +24,9 @@ function validate(raw) {
   if (!Array.isArray(raw.repositories) || !raw.repositories.length) {
     throw new Error('Configuration needs at least one repository.');
   }
+  if (raw.dueDays !== undefined && !(Number.isInteger(raw.dueDays) && raw.dueDays > 0 && raw.dueDays <= 365)) {
+    throw new Error('"dueDays" must be a whole number of days between 1 and 365.');
+  }
   const order = Array.isArray(raw.priorityOrder) ? raw.priorityOrder : [];
   for (const [severity, priority] of Object.entries(raw.priorityBySeverity ?? {})) {
     if (!(severity in raw.severityOptions) || !order.includes(priority)) {

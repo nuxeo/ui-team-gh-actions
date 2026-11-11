@@ -58,7 +58,8 @@ only counts. Everything else is in Jira:
   shards for alerts already reported as closed, and one `dependabot-ai-triage-teams-card-<runId>` per run until its
   Teams delivery succeeds). Closure history is kept exactly, as per-repository ranges split across as many
   properties as needed; every property stays under Jira's 32 KB limit. A short private report comment is added only when
-  a run proposes or makes a change, needs review, or fails; a clean week adds no comment. Each comment lists the
+  a run proposes or makes a change, needs review, fails, or has more open Critical/High tickets than the Teams card
+  shows; otherwise a clean week adds no comment. Each comment lists the
   sources, the counts, one line per affected ticket (with the fix, reason and acceptance criteria only for new or
   extended tickets) and anything that needs attention. Before storing anything, every run checks that the issue has
   exactly the configured security level (`controlSecurityLevelId`) and its label, and that it cannot be read without
@@ -74,6 +75,7 @@ only counts. Everything else is in Jira:
 | Control issue and its required security level id                                                                                                                                      | `config.json` (`controlIssue`, `controlSecurityLevelId`)                                                         |
 | Defect Severity field and option IDs, and the priority for each severity (`priorityBySeverity`, ranked by `priorityOrder`); all revalidated against Jira create metadata on every run | `config.json`                                                                                                    |
 | Copilot CLI version, model, timeout                                                                                                                                                   | `config.json` (`copilot`)                                                                                        |
+| Days to fix a Critical/High ticket                                                                                                                                                    | `config.json` (`dueDays`, 15)                                                                                    |
 | Security epic and quarter                                                                                                                                                             | nuxeo-web-ui variables `SECURITY_EPIC`, `SECURITY_EPIC_QUARTER` (e.g. `NXENG-987`, `2026-Q4`)                    |
 | Scheduled mode                                                                                                                                                                        | nuxeo-web-ui variable `DEPENDABOT_AI_TRIAGE_MODE` (`preview` by default)                                         |
 | Write approval                                                                                                                                                                        | nuxeo-web-ui variable `DEPENDABOT_AI_TRIAGE_ALLOW_AUTOMATIC` (`true` to allow writes)                            |
@@ -111,10 +113,28 @@ the variables were not updated, the run still reconciles and reports, but refuse
   blocker is recorded in the ownership property instead.
 
   The Teams card always has the same layout: the run time; "scan incomplete" with the failures if the scan was not
-  complete; the findings result (new findings by severity, or "No new untriaged Dependabot findings were identified."
-  — never stated for an incomplete scan); the number of open alerts and how many were already tracked; existing
-  tickets now tracked; tickets created; tickets updated (scope or severity); changed blockers; items needing review;
-  and the repositories, full report link and run id.
+  complete; the findings result (new findings by severity, plus "N Critical/High findings need attention" when there
+  are any, or "No new untriaged Dependabot findings were identified." — never stated for an incomplete scan); the
+  number of open alerts and how many were already tracked; a **Tickets created** table (ticket, severity, status:
+  "Open", "On Hold (no patch)", "On Hold (waiting on upstream)", or "Blocked, not On Hold (…)" when the hold failed);
+  a **Tickets updated** table (ticket, severity and what changed: "N alerts added", "Scope extended", "Patch now
+  available", "Update posted", "Now tracked", "Put On Hold" / "put On Hold", "Severity raised from X" or "Severity
+  set"); items needing review; the **Open Critical / High tickets** table (below); and the repositories, full report
+  link and run id. A ticket changed by this run is listed once among the changes; the open Critical/High table is
+  the standing list, so a changed Critical/High ticket also appears there. Tables show at most 10 rows; the rest are
+  in the full report. A card that is too large drops whole sections from the end, never the header or the open
+  Critical/High table.
+
+  **Fix deadlines.** Every Critical/High ticket this automation tracks that is not Done (Open, In Progress, On Hold
+  or any other open status) is due `dueDays` (15) calendar days, in the configured timezone, after its start date:
+  the ticket's creation date, or the latest day this automation raised it into Critical/High. A raise's date is saved
+  in the run state (`dueFrom`) as soon as the raise is verified, including a raise an interrupted run made and the
+  next run recovers; a raise from High to Critical does not restart the clock. Days left are recomputed every run. New Critical/High
+  tickets state "Fix due by …" in their description, and a raise into Critical/High states it in its "severity
+  raised" comment. The Teams card lists these tickets last with their status, due date and days left, overdue first;
+  the private report has the full list with repository, open alerts and start date, and is also posted when the
+  card cannot show the whole list. Jira's own Due date field is not used: it is not on the Bug screens of the
+  configured projects.
 
   Follow-up writes (links to related tickets, the On Hold reason of a created ticket, the "severity raised" explanation) are owed by the
   action that needs them and are never lost: one that fails, or that a stopped run never reached, is replayed by later

@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { jiraClient } from './lib/clients.mjs';
 import { DEFAULT_CONFIG, loadConfig } from './lib/config.mjs';
+import { keptStarts, latestStarts, localDate, openHighTickets, raiseDeadline, raiseStarts } from './lib/due.mjs';
 import { validatePlan } from './lib/plan-validator.mjs';
 import { OWNED_LABEL, OWNERSHIP_PROPERTY, fingerprint } from './lib/reconcile.mjs';
 import {
@@ -328,13 +329,32 @@ export class Executor {
     }
   }
 
-  recordRaise(ticket, from, to, alerts) {
+  /**
+   * Saves the day a verified raise into Critical/High started a ticket's clock in the run state. It runs inside the
+   * raise step, after Jira shows the raise and before the step is journalled done; if it fails the step's outcome is
+   * unknown, so the next automatic run reconciles it from Jira and saves the date then (before settling the entry).
+   */
+  async saveStart(ticket, dueFrom) {
+    if (!ticket || !dueFrom) {
+      return;
+    }
+    try {
+      await this.control.saveState({ dueFrom: latestStarts(this.control.state?.dueFrom, { [ticket]: dueFrom }) });
+    } catch (error) {
+      // No HTTP status: the raise itself is fine, so recovery must not treat it as an unreadable ticket and give up.
+      const message = `fix deadline start of ${ticket} not saved (${error.message})`;
+      throw Object.assign(new Error(message), { uncertain: true });
+    }
+  }
+
+  recordRaise(ticket, from, to, alerts, dueFrom) {
     const ids = alerts.filter((alert) => alert.severity === to).map((alert) => alertId(alert.repository, alert.number));
     const existing = this.outcome.severityRaises.find((raise) => raise.ticket === ticket);
+    const due = dueFrom ? { dueFrom } : {};
     if (existing) {
-      Object.assign(existing, { to, applied: true });
+      Object.assign(existing, { to, applied: true, ...due });
     } else {
-      this.outcome.severityRaises.push({ ticket, from, to, alerts: ids, applied: true });
+      this.outcome.severityRaises.push({ ticket, from, to, alerts: ids, applied: true, ...due });
     }
   }
 
@@ -380,6 +400,8 @@ export class Executor {
       if (!held) {
         return false;
       }
+      // The transition is verified: the ticket is On Hold even if its reason comment below still fails.
+      report.onHold = true;
     }
     if (created) {
       const id = holdCommentId(runId, target.key);
@@ -452,7 +474,7 @@ export class Executor {
     return Boolean(recorded);
   }
 
-  createFields(group, alerts, label) {
+  createFields(group, alerts, label, due) {
     const repo = this.config.repositoryConfig(group.repository);
     const summary = group.summary.startsWith('[Security]') ? group.summary : `[Security] ${group.summary}`;
     const labels = [
@@ -471,6 +493,7 @@ export class Executor {
       description: ticketDescription({
         group,
         alerts,
+        due,
         evidence: this.inventory.evidence,
         config: this.config,
         runId: this.inventory.runId,
@@ -511,14 +534,25 @@ export class Executor {
     const runKey = shortHash([runId, group.remediationId]);
     const label = `dat-${runKey}`;
     const alerts = this.groupAlerts(group);
+    // One date for the description, the report and the open list, even if the run crosses midnight.
+    const due = raiseDeadline(null, group.severity, this.config);
     const run = async () => {
-      const existing = await this.jira.search(`labels = "${label}" ORDER BY created ASC`, ['summary']);
+      const existing = await this.jira.search(`labels = "${label}" ORDER BY created ASC`, ['summary', 'created']);
       if (!existing.length) {
         await this.checkLiveCoverage(group, alerts);
       }
-      const key = existing[0]?.key ?? (await this.jira.create(this.createFields(group, alerts, label))).key;
+      const key = existing[0]?.key ?? (await this.jira.create(this.createFields(group, alerts, label, due))).key;
       await this.verifyWritten(key, { severity: group.severity, epic: this.config.epic });
-      return { key, detail: existing.length ? '(reused the ticket from an interrupted attempt of this run)' : '' };
+      // The day the ticket was created (its description states the deadline from it), kept with the result so a retry
+      // of this run on a later day still reports that day.
+      const created = existing[0]?.fields?.created;
+      const today = due?.dueFrom ?? localDate(new Date(), this.config.timezone);
+      const createdOn = created ? localDate(new Date(created), this.config.timezone) : today;
+      return {
+        key,
+        createdOn,
+        detail: existing.length ? '(reused the ticket from an interrupted attempt of this run)' : '',
+      };
     };
     // The related tickets travel with the reservation, so links a stopped run never made are still made later.
     run.recovery = { label, links: group.relatedTickets ?? [], severity: group.severity, epic: this.config.epic };
@@ -528,7 +562,13 @@ export class Executor {
     if (!result) {
       return;
     }
-    Object.assign(report, { ticketKey: result.key, action: 'created', blockerChanged: group.kind === 'blocked' });
+    Object.assign(report, {
+      ticketKey: result.key,
+      action: 'created',
+      blockerChanged: group.kind === 'blocked',
+      // The start date stated in the description, for the open list of this run.
+      createdOn: result.createdOn ?? due?.dueFrom,
+    });
     const linked = await mapSequential(group.relatedTickets ?? [], (related) => this.link(result.key, related));
     // Ownership waits for the links: until it is recorded the alerts are re-planned, and failed links are retried.
     if (linked.every(Boolean)) {
@@ -717,7 +757,12 @@ export class Executor {
       .filter((alert) => alert.severity === group.severity)
       .map((alert) => `#${alert.number}`);
     const priorityChange = priority ? { priority: { from: target.priority, to: priority } } : {};
-    return { key, raise: { from: target.severity ?? null, to: group.severity, alerts: drivers, ...priorityChange } };
+    const deadline = raiseDeadline(target.severity, group.severity, this.config);
+    await this.saveStart(key, deadline?.dueFrom);
+    return {
+      key,
+      raise: { from: target.severity ?? null, to: group.severity, alerts: drivers, ...priorityChange, ...deadline },
+    };
   }
 
   /**
@@ -775,7 +820,10 @@ export class Executor {
     // Recorded before the edit, so a recovered raise is explained with the real values and driving alerts.
     const drivers = alerts.filter((alert) => alert.severity === group.severity).map((alert) => `#${alert.number}`);
     const priorityChange = priorityTo ? { priority: { from: target.priority, to: priorityTo } } : {};
-    const raise = raiseTo ? { from: target.severity ?? null, to: raiseTo, alerts: drivers, ...priorityChange } : null;
+    const deadline = raiseTo ? raiseDeadline(target.severity, raiseTo, this.config) : null;
+    const raise = raiseTo
+      ? { from: target.severity ?? null, to: raiseTo, alerts: drivers, ...priorityChange, ...deadline }
+      : null;
     // A retry of this run reuses the recorded result, so the severity change is still explained even though Jira
     // now shows the raised value.
     const scope = await this.act(
@@ -789,7 +837,7 @@ export class Executor {
       return;
     }
     if (scope.raise) {
-      this.recordRaise(group.ticket, scope.raise.from ?? 'unset', group.severity, alerts);
+      this.recordRaise(group.ticket, scope.raise.from ?? 'unset', group.severity, alerts, scope.raise.dueFrom);
     }
     if (!(await this.scopeComments(group, target, id, scope, added))) {
       return;
@@ -798,6 +846,8 @@ export class Executor {
     Object.assign(report, {
       ticketKey: group.ticket,
       blockerChanged: group.kind === 'blocked' && (group.operation === 'extend' || Boolean(group.updateNote)),
+      added: added.length,
+      previousKind: target.ownership?.kind ?? null,
     });
     // Reported as done only once ownership is recorded; until then it stays proposed and its failure is reported.
     if (await this.finish(group, target, alerts, report)) {
@@ -825,6 +875,7 @@ export class Executor {
       to: raise.to,
       alerts: raise.alerts,
       ...(plannedPriority ? { priority: { from: before.priority, to: plannedPriority } } : {}),
+      ...raiseDeadline(before.severity, raise.to, this.config),
     };
     const result = await this.act(
       id,
@@ -850,15 +901,20 @@ export class Executor {
             return { key: raise.ticket, unchanged: true };
           }
           const priorityChange = priorityTo ? { priority: { from: priority, to: priorityTo } } : {};
+          const deadline = raiseDeadline(severity, raise.to, this.config);
+          await this.saveStart(raise.ticket, deadline?.dueFrom);
           return {
             key: raise.ticket,
-            raise: { from: severity ?? null, to: raise.to, alerts: raise.alerts, ...priorityChange },
+            raise: { from: severity ?? null, to: raise.to, alerts: raise.alerts, ...priorityChange, ...deadline },
           };
         },
         { key: raise.ticket, raiseTo: raise.to, priorityTo: plannedPriority, raise: plannedRaise },
       ),
     );
     raise.applied = Boolean(result) && !result.unchanged;
+    if (result?.raise?.dueFrom) {
+      raise.dueFrom = result.raise.dueFrom;
+    }
     if (result?.raise) {
       await this.explainRaise(id, raise.ticket, result.raise);
     }
@@ -974,6 +1030,9 @@ export class Executor {
     const ticket = key ?? entry.recovery.key;
     // Only an action that raised severity owes an explanation; a follow-up write itself owes nothing.
     const raise = status === 'done' && !RETRIED.has(entry.kind) ? entry.recovery.raise : null;
+    // Before the entry is settled: a verified raise into Critical/High that an interrupted run made keeps the start
+    // date its comment states. If this save fails the entry stays pending and is reconciled again next run.
+    await this.saveStart(ticket, raise?.dueFrom);
     await this.control.settle(entry.id, status, {
       recovered: true,
       ...(ticket ? { key: ticket } : {}),
@@ -1236,6 +1295,7 @@ async function saveState(control, outcome, inventory) {
       ...outcome.closedMismatches.map((item) => item.id),
     ]);
     await control.saveState({
+      dueFrom: keptStarts(outcome.dueStarts ?? control.state?.dueFrom, outcome.openHigh),
       lastSuccess: record,
       pendingUnowned: (outcome.untriaged ?? []).filter((id) => pending.has(id)),
       reportedMismatches: outcome.closedMismatches.map((item) => item.id),
@@ -1245,7 +1305,10 @@ async function saveState(control, outcome, inventory) {
       await control.saveCleared(outcome.cleared.map((item) => item.id));
     }
   } else {
-    await control.saveState({ lastFailure: { ...record, failures: outcome.failures.slice(0, 20) } });
+    await control.saveState({
+      dueFrom: keptStarts(outcome.dueStarts ?? control.state?.dueFrom, outcome.openHigh),
+      lastFailure: { ...record, failures: outcome.failures.slice(0, 20) },
+    });
   }
 }
 
@@ -1311,6 +1374,22 @@ function uniqueById(items) {
   return [...new Map(items.map((item) => [item.id, item])).values()];
 }
 
+/** Open Critical/High tickets with their deadline, for the report and the Teams card. */
+export function listOpenHigh(control, config, inventory, outcome) {
+  try {
+    outcome.dueStarts = latestStarts(control.state?.dueFrom, raiseStarts(outcome.severityRaises));
+    outcome.openHigh = openHighTickets({
+      tickets: inventory.tickets,
+      alerts: inventory.alerts,
+      outcome,
+      config,
+      dueFrom: outcome.dueStarts,
+    });
+  } catch (error) {
+    outcome.failures.push(`Open Critical/High tickets: ${error.message}`);
+  }
+}
+
 async function executeLocked({ jira, control, config, inventory, outcome, plan }) {
   await control.load();
   const executor = new Executor({ jira, control, config, inventory, outcome });
@@ -1328,6 +1407,7 @@ async function executeLocked({ jira, control, config, inventory, outcome, plan }
   } catch (error) {
     outcome.failures.push(`Executor: ${error.message}`);
   }
+  listOpenHigh(control, config, inventory, outcome);
   outcome.complete = outcome.failures.length === 0;
   await publishReport(jira, config, outcome);
   // A failed report makes the run incomplete before the Teams card is built, so it cannot claim a clean scan.
