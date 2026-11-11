@@ -227,7 +227,7 @@ test('Teams: clean run uses the agreed wording and no tables', () => {
   const card = teamsCard(baseOutcome(), teamsConfig);
   const textBlocks = cardText(card);
   assert.match(textBlocks, /No new untriaged Dependabot findings were identified\./);
-  assert.match(textBlocks, /The bugs took the day off\. We checked anyway\./);
+  assert.doesNotMatch(textBlocks, /🐛|took the day off|uninvited guests/);
   assert.match(textBlocks, /Run ID: 19000000001/);
   assert.doesNotMatch(JSON.stringify(card), /ColumnSet|"Table"/);
 });
@@ -266,6 +266,7 @@ test('Teams: High findings are highlighted, created tickets listed, FYI only aft
   );
   assert.match(textBlocks, /No new Critical findings\./);
   assert.match(textBlocks, /1 High finding needs attention\./);
+  assert.doesNotMatch(textBlocks, /🐛|uninvited guests|took the day off/);
   assert.doesNotMatch(textBlocks, /0 Critical and/);
   assert.match(textBlocks, /Tickets created · 2/);
   assert.match(textBlocks, /\[LIB-3000\]\(https:\/\/jira\.example\/browse\/LIB-3000\) · High · lib/);
