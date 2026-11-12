@@ -25,6 +25,7 @@ import {
   isMainModule,
   log,
   mapSequential,
+  mentionsWord,
   request,
   shortHash,
   textOf,
@@ -600,21 +601,33 @@ export class Executor {
     // Everything changed since collection started; without a start time, a wide 24-hour window is used instead.
     const elapsed = Math.ceil((Date.now() - Date.parse(this.inventory.startedAt)) / 60000) + 5;
     const minutes = Number.isFinite(elapsed) ? elapsed : 1440;
-    const ids = [...new Set(alerts.flatMap((alert) => [alert.ghsa, alert.cve, alert.url]).filter(Boolean))];
-    const packages = [...new Set(alerts.map((alert) => alert.package).filter(Boolean))];
-    const terms = [
-      ...ids.map((id) => String.raw`text ~ "\"${id}\""`),
-      ...packages.map((name) => String.raw`summary ~ "\"${name}\""`),
-    ];
-    const jql = `project = ${project} AND updated >= -${minutes}m AND (${terms.join(' OR ')}) ORDER BY key`;
-    const issues = await this.jira.search(jql, ['updated'], []);
-    return issues.filter((issue) => {
+    const recent = (terms) =>
+      `project = ${project} AND updated >= -${minutes}m AND (${terms.join(' OR ')}) ORDER BY key`;
+    const isChanged = (issue) => {
       if (this.touched.has(issue.key)) {
         return false;
       }
       const collected = this.tickets.get(issue.key);
       return !collected || collected.updated !== issue.fields?.updated;
-    });
+    };
+    const ids = [...new Set(alerts.flatMap((alert) => [alert.ghsa, alert.cve, alert.url]).filter(Boolean))];
+    const packages = [...new Set(alerts.map((alert) => alert.package).filter(Boolean))];
+    // An identifier counts wherever it is. A package counts only as a word in the summary: a ticket raised for these
+    // alerts during planning names it there, while a common name ("send", "debug") in a description or comment must
+    // not hold back creation. Those mentions are read by the next run's collection and judged by the planner.
+    const byId = ids.length
+      ? await this.jira.search(recent(ids.map((id) => String.raw`text ~ "\"${id}\""`)), ['updated'], [])
+      : [];
+    const byPackage = packages.length
+      ? await this.jira.search(
+          recent(packages.map((name) => String.raw`summary ~ "\"${name}\""`)),
+          ['updated', 'summary'],
+          [],
+        )
+      : [];
+    const named = (issue) => packages.some((name) => mentionsWord(issue.fields?.summary ?? '', name));
+    const found = new Map([...byId, ...byPackage.filter(named)].filter(isChanged).map((issue) => [issue.key, issue]));
+    return [...found.values()];
   }
 
   /**
@@ -1267,12 +1280,35 @@ function describe(outcome, inventory, plan) {
   });
 }
 
+/**
+ * Posts a control-issue comment once: it carries a marker made of the run id and its content, so a re-run of the
+ * same workflow run (or a retried multi-part report) never posts the same comment twice. A re-run whose outcome
+ * differs reports it, because its content differs.
+ */
+export async function postOnce(jira, config, runId, document, seen) {
+  const marker = commentMarker('report', runId, document);
+  if (seen.has(marker)) {
+    return;
+  }
+  await jira.addComment(config.controlIssue, adfDoc([...document.content, adfParagraph(adfText(`Ref ${marker}`))]));
+  seen.add(marker);
+}
+
+/** Markers of the control-issue comments already posted, read once per run. */
+async function postedMarkers(jira, config) {
+  const comments = await jira.allComments(config.controlIssue);
+  return new Set(comments.flatMap((comment) => textOf(comment.body).match(/dat-[0-9a-f]{12}/g) ?? []));
+}
+
 async function publishReport(jira, config, outcome) {
   if (!reportNeeded(outcome)) {
     return;
   }
   try {
-    await mapSequential(runReport(outcome, config), (document) => jira.addComment(config.controlIssue, document));
+    const seen = await postedMarkers(jira, config);
+    await mapSequential(runReport(outcome, config), (document) =>
+      postOnce(jira, config, outcome.runId, document, seen),
+    );
   } catch (error) {
     outcome.failures.push(`Report comment: ${error.message}`);
   }
@@ -1316,10 +1352,8 @@ async function saveState(control, outcome, inventory) {
 async function noteDeliveryFailure(jira, config, outcome) {
   const reason = outcome.failures.at(-1) ?? 'Teams notification was not sent.';
   try {
-    await jira.addComment(
-      config.controlIssue,
-      adfDoc([adfParagraph(adfText(`Run ${outcome.runId} is INCOMPLETE: ${reason}`))]),
-    );
+    const note = adfDoc([adfParagraph(adfText(`Run ${outcome.runId} is INCOMPLETE: ${reason}`))]);
+    await postOnce(jira, config, outcome.runId, note, await postedMarkers(jira, config));
   } catch (error) {
     outcome.failures.push(`Report correction: ${error.message}`);
   }

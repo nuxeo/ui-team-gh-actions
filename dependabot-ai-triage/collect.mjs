@@ -15,6 +15,7 @@ import {
   isMainModule,
   log,
   mapSequential,
+  mentionsWord,
   parseVersion,
   quarterExpired,
   textOf,
@@ -159,10 +160,11 @@ export function ticketQueries(config, alerts) {
     const terms = batch.map((id) => String.raw`text ~ "\"${id}\""`);
     queries.push({ jql: `project in (${projects}) AND (${terms.join(' OR ')}) ORDER BY key`, matches: batch });
   }
-  // Upgrade tickets outside the epic and without the dependabot label often name only the package.
+  // Upgrade tickets outside the epic and without the dependabot label often name only the package, and not always
+  // in the summary: the text search also covers the description and the comments.
   const packages = [...new Set(alerts.map((alert) => alert.package).filter(Boolean))];
   for (const batch of batches(packages)) {
-    const terms = batch.map((name) => String.raw`summary ~ "\"${name}\""`);
+    const terms = batch.map((name) => String.raw`text ~ "\"${name}\""`);
     queries.push({
       jql: `project in (${projects}) AND ${recent} AND (${terms.join(' OR ')}) ORDER BY key`,
       matches: batch.map((name) => `package:${name}`),
@@ -399,16 +401,66 @@ export function plannerTicket(ticket, comments) {
   };
 }
 
-function escapeRegExp(value) {
-  return value.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+export function mentions(ticket, alert) {
+  const text = `${ticket.summary}\n${ticket.description}`;
+  const lower = text.toLowerCase();
+  return (
+    mentionsWord(text, alert.package) ||
+    [alert.ghsa, alert.cve, alert.url].filter(Boolean).some((id) => lower.includes(id.toLowerCase()))
+  );
 }
 
-export function mentions(ticket, alert) {
-  const text = `${ticket.summary}\n${ticket.description}`.toLowerCase();
-  const word = new RegExp(`(^|[^a-z0-9@/_-])${escapeRegExp(alert.package.toLowerCase())}([^a-z0-9_-]|$)`);
-  return (
-    word.test(text) || [alert.ghsa, alert.cve, alert.url].filter(Boolean).some((id) => text.includes(id.toLowerCase()))
+// A package name can be a common word ("send", "debug", "glob"): a ticket found only by the package text search must
+// name that package as a word in its recent comments, and at most this many such tickets are read per package, so one
+// common name cannot crowd out the hits of another.
+export const MAX_PACKAGE_HITS = 10;
+
+/** Tickets found only by the package text search (not by identifier, mention, ownership or the epic). */
+export function packageOnlyHits(tickets, aiAlerts, selected) {
+  const chosen = new Set(selected.map((ticket) => ticket.key));
+  const packages = new Set(aiAlerts.map((alert) => `package:${alert.package}`));
+  return tickets.filter(
+    (ticket) => !chosen.has(ticket.key) && (ticket.matchedBy ?? []).some((match) => packages.has(match)),
   );
+}
+
+/** Keeps the package-only hits whose recent comments name their package; returns them with those comments. */
+export async function confirmPackageHits(jira, hits, aiAlerts, warnings) {
+  const recentFirst = [...hits].sort((a, b) => String(b.updated).localeCompare(String(a.updated)));
+  const wanted = new Map();
+  for (const name of new Set(aiAlerts.map((alert) => alert.package))) {
+    const found = recentFirst.filter((ticket) => (ticket.matchedBy ?? []).includes(`package:${name}`));
+    if (found.length > MAX_PACKAGE_HITS) {
+      warnings.push(
+        `${found.length} tickets mention ${name} only outside their summary and description; ` +
+          `the ${MAX_PACKAGE_HITS} most recently updated were checked.`,
+      );
+    }
+    for (const ticket of found.slice(0, MAX_PACKAGE_HITS)) {
+      wanted.set(ticket.key, { ticket, names: [...(wanted.get(ticket.key)?.names ?? []), name] });
+    }
+  }
+  const confirmed = [];
+  await mapSequential([...wanted.values()], async ({ ticket, names }) => {
+    const comments = await jira.recentComments(ticket.key, 5);
+    const text = comments.map((comment) => textOf(comment.body)).join('\n');
+    if (names.some((name) => mentionsWord(text, name))) {
+      confirmed.push({ ticket, comments });
+    }
+  });
+  return confirmed;
+}
+
+/** The tickets shown to the planner, with their recent comments: the selected ones plus confirmed package hits. */
+export async function candidateTickets(ctx, tickets, aiAlerts, currentOwner) {
+  const selected = selectCandidates(tickets, aiAlerts, currentOwner, ctx.config);
+  const packageHits = packageOnlyHits(tickets, aiAlerts, selected);
+  const confirmed = await confirmPackageHits(ctx.jira, packageHits, aiAlerts, ctx.warnings);
+  const comments = await Promise.all(selected.map((ticket) => ctx.jira.recentComments(ticket.key, 5)));
+  return [
+    ...selected.map((ticket, index) => plannerTicket(ticket, comments[index])),
+    ...confirmed.map((item) => plannerTicket(item.ticket, item.comments)),
+  ];
 }
 
 export function selectCandidates(tickets, aiAlerts, currentOwner, config) {
@@ -426,9 +478,9 @@ export function selectCandidates(tickets, aiAlerts, currentOwner, config) {
     }
     const openInEpic = ticket.statusCategory !== 'done' && ticket.parent === config.epic;
     const matched = new Set(ticket.matchedBy ?? []);
-    // Identifier searches also match comments, so such a hit counts even if the description is silent.
-    const searchHit = (alert) =>
-      [alert.ghsa, alert.cve, alert.url, `package:${alert.package}`].some((id) => id && matched.has(id));
+    // Identifier searches also match comments, so such a hit counts even if the description is silent. A package
+    // search hit counts only once its text is confirmed (`packageOnlyHits`, `confirmPackageHits`).
+    const searchHit = (alert) => [alert.ghsa, alert.cve, alert.url].some((id) => id && matched.has(id));
     return aiAlerts.some(
       (alert) =>
         searchHit(alert) ||
@@ -591,8 +643,6 @@ async function buildPlannerInput(ctx, { alerts, repositories, tickets, result })
     const npmPackage = npmInfo[index].package;
     alert.registryFix = npmPackage?.fixAboveInstalled ?? npmPackage?.fixInSomeVulnerableMajor ?? null;
   });
-  const candidates = selectCandidates(tickets, aiAlerts, currentOwner, ctx.config);
-  const comments = await Promise.all(candidates.map((ticket) => ctx.jira.recentComments(ticket.key, 5)));
   const plannerAlerts = aiAlerts.map((alert, index) => {
     const id = alertId(alert.repository, alert.number);
     const owner = currentOwner[id] ?? null;
@@ -621,7 +671,7 @@ async function buildPlannerInput(ctx, { alerts, repositories, tickets, result })
   const inventoryDigest = writePlannerInput(path.join(ctx.work, 'planner'), {
     runInfo,
     plannerAlerts,
-    plannerTickets: candidates.map((ticket, index) => plannerTicket(ticket, comments[index])),
+    plannerTickets: await candidateTickets(ctx, tickets, aiAlerts, currentOwner),
     covered,
   });
   return { currentOwner, aiInput, evidence, inventoryDigest };

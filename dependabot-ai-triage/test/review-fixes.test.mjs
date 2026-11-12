@@ -8,8 +8,11 @@ import { Executor, commentMarker, apply, postTeams, runPending, severityMarker, 
 import {
   branchEvidence,
   clearedAlerts,
+  candidateTickets,
   collect,
+  confirmPackageHits,
   npmSummary,
+  packageOnlyHits,
   plannerTicket,
   readTickets,
   selectCandidates,
@@ -404,6 +407,34 @@ test('a failed Teams delivery is recorded after the report and makes the run inc
   }
   const comments = jira.issues.get(config.controlIssue).comments.map((comment) => JSON.stringify(comment));
   assert.match(comments.at(-1), /INCOMPLETE: Teams delivery failed/);
+});
+
+test('re-running the same workflow run posts no report or delivery note twice; a changed outcome is reported', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => new Response('', { status: 400 });
+  const jira = new FakeJira();
+  const run = async (inventory) => {
+    const work = workDir(inventory);
+    await withEnv(
+      { TRIAGE_WORK_DIR: work, TRIAGE_CONFIG: CONFIG_FILE, DEPENDABOT_TEAMS_WEBHOOK_URL: 'https://hooks.example/x' },
+      () => apply(jira),
+    );
+    process.exitCode = 0;
+    return jira.issues.get(config.controlIssue).comments.map((comment) => JSON.stringify(comment));
+  };
+  try {
+    const first = await run(baseInventory({ mode: 'automatic', warnings: ['A note for the report.'] }));
+    assert.equal(first.length, 2, 'a report and a delivery note');
+    assert.match(first[0], /A note for the report/);
+    assert.match(first[1], /INCOMPLETE: Teams delivery failed/);
+    assert.ok(first.every((comment) => /Ref dat-[0-9a-f]{12}/.test(comment)));
+    assert.deepEqual(await run(baseInventory({ mode: 'automatic', warnings: ['A note for the report.'] })), first);
+    const changed = await run(baseInventory({ mode: 'automatic', warnings: ['A new note for this attempt.'] }));
+    assert.ok(changed.length > first.length);
+    assert.match(changed.slice(first.length).join(), /A new note for this attempt/);
+  } finally {
+    globalThis.fetch = original;
+  }
 });
 
 test('planner parse failures never put the reply in the public log or the error file', async () => {
@@ -1028,11 +1059,91 @@ test('tickets found by identifier or package search stay candidates even when on
   };
   const byPackage = { ...commentOnly, key: 'LIB-8', matchedBy: [`package:${alert.package}`] };
   const unrelated = { ...commentOnly, key: 'LIB-9', matchedBy: [] };
-  const keys = selectCandidates([commentOnly, byPackage, unrelated], [alert], {}, config).map((ticket) => ticket.key);
-  assert.deepEqual(keys.sort(), ['LIB-7', 'LIB-8']);
+  const tickets = [commentOnly, byPackage, unrelated];
+  const selected = selectCandidates(tickets, [alert], {}, config);
+  assert.deepEqual(
+    selected.map((ticket) => ticket.key),
+    ['LIB-7'],
+  );
+  // A package-name hit is only a candidate once its comments are checked (see confirmPackageHits).
+  assert.deepEqual(
+    packageOnlyHits(tickets, [alert], selected).map((ticket) => ticket.key),
+    ['LIB-8'],
+  );
   const queries = ticketQueries({ ...config, epic: 'EPIC-1' }, [alert]);
-  assert.ok(queries.some((query) => /summary ~ "\\"pkg-match\\""/.test(query.jql)));
+  // The package is searched in the summary, description and comments, not only the summary.
+  assert.ok(queries.some((query) => /text ~ "\\"pkg-match\\""/.test(query.jql)));
+  assert.ok(queries.every((query) => !/summary ~/.test(query.jql)));
   assert.ok(queries.some((query) => query.matches.includes(alert.ghsa)));
+});
+
+test('a package-name hit is kept only when its comments name that package, and at most 10 per package are read', async () => {
+  const alert = liveAlerts().find((item) => item.repository === EL && item.number === 108);
+  const other = { ...alert, package: '@scope/other' };
+  const jira = new FakeJira();
+  const hit = (key, comment, updated = '2026-11-01', name = alert.package) => {
+    jira.issues.set(key, { key, fields: { labels: [] }, properties: {}, comments: [comment] });
+    return { key, updated, matchedBy: [`package:${name}`] };
+  };
+  const named = hit('LIB-1', `Bump ${alert.package} with the other upgrades.`);
+  const prefix = hit('LIB-2', `Rework ${alert.package}-extra usage.`);
+  const wrong = hit('LIB-3', 'Upgrade @scope/other.');
+  const warnings = [];
+  const confirmed = await confirmPackageHits(jira, [named, prefix, wrong], [alert, other], warnings);
+  assert.deepEqual(
+    confirmed.map((item) => item.ticket.key),
+    ['LIB-1'],
+  );
+  assert.deepEqual(warnings, []);
+  // Thirty recent hits for one package do not push out an older hit for another package.
+  const many = Array.from({ length: 30 }, (_, index) => hit(`LIB-${100 + index}`, 'x', `2026-10-${10 + index}`));
+  const older = hit('LIB-9', 'Upgrade @scope/other to 3.0.', '2026-01-01', '@scope/other');
+  const read = [];
+  const recentComments = jira.recentComments.bind(jira);
+  jira.recentComments = (key, count) => {
+    read.push(key);
+    return recentComments(key, count);
+  };
+  const result = await confirmPackageHits(jira, [...many, older], [alert, other], warnings);
+  assert.match(warnings.join(), new RegExp(`30 tickets mention ${alert.package} only`));
+  assert.deepEqual(
+    result.map((item) => item.ticket.key),
+    ['LIB-9'],
+  );
+  assert.deepEqual(read.sort(), [...many.slice(20), older].map((ticket) => ticket.key).sort());
+});
+
+test('the planner sees selected tickets and confirmed package hits with their comments, not unconfirmed ones', async () => {
+  const alert = liveAlerts().find((item) => item.repository === EL && item.number === 108);
+  const ticket = (key, matchedBy, comment) => {
+    return {
+      key,
+      project: 'LIB',
+      summary: 'Upgrade',
+      description: '',
+      statusCategory: 'new',
+      links: [],
+      matchedBy,
+      comment,
+    };
+  };
+  const tickets = [
+    ticket('LIB-7', [alert.ghsa], 'Tracked here.'),
+    ticket('LIB-8', [`package:${alert.package}`], `Bump ${alert.package} too.`),
+    ticket('LIB-9', [`package:${alert.package}`], 'Resend the request.'),
+  ];
+  const jira = new FakeJira();
+  for (const { key, comment } of tickets) {
+    jira.issues.set(key, { key, fields: { labels: [] }, properties: {}, comments: [comment] });
+  }
+  const shown = await candidateTickets({ jira, config, warnings: [] }, tickets, [alert], {});
+  assert.deepEqual(
+    shown.map((item) => [item.key, item.recentComments.map((comment) => comment.body ?? comment)]),
+    [
+      ['LIB-7', ['Tracked here.']],
+      ['LIB-8', [`Bump ${alert.package} too.`]],
+    ],
+  );
 });
 
 test('npm alias declarations are resolved for dependents and direct declarations', () => {
@@ -1261,6 +1372,30 @@ test('a collected candidate edited during planning defers creation, but edits by
   run.exec.touched.add('LIB-44');
   await run.exec.create(createGroup(), {});
   assert.deepEqual(run.outcome.failures, []);
+});
+
+test('a ticket edited during planning holds back creation only when its summary names the package as a word', async () => {
+  const tickets = registerTickets().map((ticket) => {
+    return { ...ticket, updated: 'before' };
+  });
+  const run = async (summary, comment) => {
+    const jira = new FakeJira(tickets);
+    const ticket = jira.issues.get('LIB-44');
+    Object.assign(ticket.fields, { updated: 'during-planning', summary, description: 'We bump pkg-match here.' });
+    ticket.comments = [comment];
+    jira.recentlyUpdated = ['LIB-44'];
+    // Only the package search finds the ticket; identifier searches miss it.
+    jira.textMatch = (jql) => !/text ~/.test(jql);
+    const { exec, outcome } = await executor(jira, tickets);
+    await exec.create(createGroup(), {});
+    assert.ok(jira.searches.some((jql) => /summary ~ "\\"pkg-match\\""/.test(jql)));
+    assert.ok(jira.searches.every((jql) => !/text ~ "\\"pkg-match\\""/.test(jql)));
+    return outcome.failures.join();
+  };
+  // A description or comment mention of a (possibly common) package name does not block creation.
+  assert.doesNotMatch(await run('Rework the login form', 'Also bump pkg-match.'), /changed after collection/);
+  assert.doesNotMatch(await run('Bump pkg-match-extra', 'x'), /changed after collection/);
+  assert.match(await run('Bump pkg-match to 2.0', 'x'), /LIB-44 changed after collection/);
 });
 
 test('closure ranges merge exactly and split across properties by size', () => {
