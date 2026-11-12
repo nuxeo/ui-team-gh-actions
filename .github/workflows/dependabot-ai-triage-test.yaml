@@ -1,0 +1,35 @@
+# Unit tests of the Dependabot AI triage. No secrets: every test uses in-memory Jira, GitHub and npm doubles.
+name: Dependabot AI triage tests
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'dependabot-ai-triage/**'
+      - '.github/workflows/dependabot-ai-triage*.yaml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'dependabot-ai-triage/**'
+      - '.github/workflows/dependabot-ai-triage*.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Unit tests
+        run: npm test --prefix dependabot-ai-triage
