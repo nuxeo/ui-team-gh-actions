@@ -61,7 +61,9 @@ only counts. Everything else is in Jira:
   a run proposes or makes a change, needs review, fails, or has more open Critical/High tickets than the Teams card
   shows; otherwise a clean week adds no comment. Each comment lists the
   sources, the counts, one line per affected ticket (with the fix, reason and acceptance criteria only for new or
-  extended tickets) and anything that needs attention. Before storing anything, every run checks that the issue has
+  extended tickets) and anything that needs attention. Each report part, and the note that a Teams delivery failed,
+  ends with a reference made of the run id and its content, so re-running the same workflow run never posts the same
+  comment twice. Before storing anything, every run checks that the issue has
   exactly the configured security level (`controlSecurityLevelId`) and its label, and that it cannot be read without
   signing in; otherwise the run stops. Who the security level admits is Jira administration: confirm it covers only
   the intended group. Do not close the issue or put it under an epic.

@@ -88,10 +88,11 @@ export class FakeJira {
   async search(jql) {
     this.searches = [...(this.searches ?? []), jql];
     const label = /labels = "([^"]+)"/.exec(jql);
-    // Text searches for recently updated tickets: tests set `recentlyUpdated` to simulate edits during planning.
+    // Text searches for recently updated tickets: tests set `recentlyUpdated` to simulate edits during planning, and
+    // optionally `textMatch(jql, issue)` to decide which text query finds which ticket.
     const matches = label
       ? (issue) => issue.fields.labels.includes(label[1])
-      : (issue) => (this.recentlyUpdated ?? []).includes(issue.key);
+      : (issue) => (this.recentlyUpdated ?? []).includes(issue.key) && (!this.textMatch || this.textMatch(jql, issue));
     return [...this.issues.values()].filter(matches).map(({ key, fields, properties }) => {
       return { key, fields, properties: structuredClone(properties) };
     });

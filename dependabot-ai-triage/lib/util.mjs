@@ -32,6 +32,12 @@ export function digest(value) {
   return createHash('sha256').update(canonical(value)).digest('hex');
 }
 
+/** Whether `text` names `name` as a whole word (npm names may contain "@", "/", "-" and "."). */
+export function mentionsWord(text, name) {
+  const escaped = name.toLowerCase().replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+  return new RegExp(`(^|[^a-z0-9@/_-])${escaped}([^a-z0-9_-]|$)`).test((text ?? '').toLowerCase());
+}
+
 export function shortHash(value, length = 12) {
   return digest(value).slice(0, length);
 }
