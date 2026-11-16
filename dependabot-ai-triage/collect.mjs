@@ -161,13 +161,13 @@ export function ticketQueries(config, alerts) {
     queries.push({ jql: `project in (${projects}) AND (${terms.join(' OR ')}) ORDER BY key`, matches: batch });
   }
   // Upgrade tickets outside the epic and without the dependabot label often name only the package, and not always
-  // in the summary: the text search also covers the description and the comments.
+  // in the summary: the text search also covers the description and the comments. One query per package: Jira does
+  // not say which term of an OR matched, and a hit is counted, capped and confirmed per package.
   const packages = [...new Set(alerts.map((alert) => alert.package).filter(Boolean))];
-  for (const batch of batches(packages)) {
-    const terms = batch.map((name) => String.raw`text ~ "\"${name}\""`);
+  for (const name of packages) {
     queries.push({
-      jql: `project in (${projects}) AND ${recent} AND (${terms.join(' OR ')}) ORDER BY key`,
-      matches: batch.map((name) => `package:${name}`),
+      jql: String.raw`project in (${projects}) AND ${recent} AND text ~ "\"${name}\"" ORDER BY key`,
+      matches: [`package:${name}`],
     });
   }
   return queries;

@@ -2058,6 +2058,36 @@ test('links of a created ticket and the explanation of a raise are queued when t
 
 // Combined local review before the next push.
 
+test('each affected package is searched on its own, so a ticket is tagged only with the package it mentions', async () => {
+  const alerts = [{ package: 'basic-ftp' }, { package: 'moment' }, { package: 'debug' }];
+  const searches = [];
+  const jira = {
+    async search(jql) {
+      searches.push(jql);
+      const issue = (key) => {
+        return { key, fields: { summary: 'Unrelated', status: { name: 'Open' } }, properties: {} };
+      };
+      if (/text ~ "\\"moment\\""/.test(jql)) {
+        return [issue('APP-1'), issue('APP-3')];
+      }
+      if (/text ~ "\\"basic-ftp\\""/.test(jql)) {
+        return [issue('APP-2'), issue('APP-3')];
+      }
+      return [];
+    },
+  };
+  const tickets = await readTickets(jira, config, alerts, []);
+  const tags = Object.fromEntries(tickets.map((ticket) => [ticket.key, ticket.matchedBy.sort()]));
+  assert.deepEqual(tags, {
+    'APP-1': ['package:moment'],
+    'APP-2': ['package:basic-ftp'],
+    'APP-3': ['package:basic-ftp', 'package:moment'],
+  });
+  const packageSearches = searches.filter((jql) => /text ~ "\\"(basic-ftp|moment|debug)\\""/.test(jql));
+  assert.equal(packageSearches.length, 3);
+  assert.ok(packageSearches.every((jql) => jql.match(/text ~/g).length === 1));
+});
+
 test('an unreadable upstream ticket is a collection warning, not a failure of every later run', async () => {
   const warnings = [];
   const owner = { blocker: { type: 'upstream-release-pending', upstreamRef: 'NXP-404' } };
