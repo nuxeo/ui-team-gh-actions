@@ -86,7 +86,9 @@ only counts. Everything else is in Jira:
 
 Secrets are stored in nuxeo-web-ui and passed by name (never `secrets: inherit`), so this workflow receives only these:
 `DEPENDABOT_TRIAGE_GITHUB_TOKEN` (reads alerts and lockfiles; read-only Dependabot alerts and contents access to both
-repositories is enough), `DEPENDABOT_TRIAGE_JIRA_EMAIL` and `DEPENDABOT_TRIAGE_TOKEN` (Jira),
+repositories is enough), `DEPENDABOT_TRIAGE_JIRA_EMAIL` and `DEPENDABOT_TRIAGE_TOKEN` (Jira; an Atlassian service
+account's scoped API token with `read:jira-work` and `write:jira-work`, called through `jiraApiBase` in `config.json`,
+the `https://api.atlassian.com/ex/jira/<cloudId>` gateway that scoped tokens require),
 `DEPENDABOT_TEAMS_WEBHOOK_URL` (dedicated Teams webhook), `DEPENDABOT_TRIAGE_COPILOT_TOKEN` (fine-grained personal
 access token with only the **Copilot Requests** account permission). Each step receives only the secrets it needs;
 the Copilot step receives only the Copilot token. The `vars` and `github` contexts are the caller's, so variables are

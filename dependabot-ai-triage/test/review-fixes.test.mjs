@@ -1907,6 +1907,49 @@ test('a priority missing from a Jira project stops collection before anything is
   assert.match(result.failures.join(), /priority "High" is not available/);
 });
 
+test('Jira REST calls go to jiraApiBase when set, links stay on the site, and the base must be a plain https URL', async () => {
+  const raw = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
+  const write = (value) => {
+    const file = path.join(mkdtempSync(path.join(tmpdir(), 'dat-config-')), 'config.json');
+    writeFileSync(file, JSON.stringify(value));
+    return file;
+  };
+  const gateway = 'https://api.atlassian.com/ex/jira/cloud-1';
+  const withBase = write({ ...raw, jiraApiBase: gateway });
+  assert.equal(loadConfig(withBase, {}).jiraApi, gateway);
+  const { jiraApiBase, ...siteOnly } = raw;
+  assert.equal(loadConfig(write(siteOnly), {}).jiraApi, raw.jiraSite);
+  assert.ok(jiraApiBase !== undefined);
+  for (const bad of ['http://api.atlassian.com/ex/jira/x', `${gateway}/`, 'api.atlassian.com/ex/jira/x']) {
+    assert.throws(() => loadConfig(write({ ...raw, jiraApiBase: bad }), {}), /jiraApiBase/);
+  }
+  const original = globalThis.fetch;
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    return new Response('{}', { status: 404 });
+  };
+  try {
+    const work = mkdtempSync(path.join(tmpdir(), 'dat-collect-'));
+    await withEnv(
+      {
+        TRIAGE_WORK_DIR: work,
+        TRIAGE_RUN_ID: RUN,
+        TRIAGE_CONFIG: withBase,
+        GH_TOKEN: 'x',
+        JIRA_EMAIL: 'bot@serviceaccount.atlassian.com',
+        JIRA_API_TOKEN: 'x',
+      },
+      () => collect(),
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+  const jira = urls.filter((url) => url.includes('/rest/api/3/'));
+  assert.ok(jira.length > 0);
+  assert.ok(jira.every((url) => url.startsWith(`${gateway}/rest/api/3/`)));
+});
+
 test('a priority mapping outside the configured order is rejected', () => {
   const file = path.join(mkdtempSync(path.join(tmpdir(), 'dat-config-')), 'config.json');
   const raw = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
