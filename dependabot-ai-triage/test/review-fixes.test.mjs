@@ -1920,7 +1920,16 @@ test('Jira REST calls go to jiraApiBase when set, links stay on the site, and th
   const { jiraApiBase, ...siteOnly } = raw;
   assert.equal(loadConfig(write(siteOnly), {}).jiraApi, raw.jiraSite);
   assert.ok(jiraApiBase !== undefined);
-  for (const bad of ['http://api.atlassian.com/ex/jira/x', `${gateway}/`, 'api.atlassian.com/ex/jira/x']) {
+  for (const bad of [
+    'http://api.atlassian.com/ex/jira/x',
+    `${gateway}/`,
+    'api.atlassian.com/ex/jira/x',
+    `${gateway}#fragment`,
+    `${gateway}?a=1`,
+    `${gateway}?`,
+    'https://user:pass@api.atlassian.com/ex/jira/x',
+    'https://',
+  ]) {
     assert.throws(() => loadConfig(write({ ...raw, jiraApiBase: bad }), {}), /jiraApiBase/);
   }
   const original = globalThis.fetch;

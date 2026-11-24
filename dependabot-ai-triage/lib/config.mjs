@@ -15,14 +15,33 @@ const REQUIRED = [
   'holdStatus',
 ];
 
+/** A base the REST path can be appended to: https, no credentials, query or fragment, no trailing slash. */
+function isPlainHttpsBase(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch (error) {
+    return false;
+  }
+  return (
+    url.protocol === 'https:' &&
+    !url.username &&
+    !url.password &&
+    !url.search &&
+    !url.hash &&
+    !value.endsWith('/') &&
+    !/[?#\s]/.test(value)
+  );
+}
+
 function validate(raw) {
   for (const key of REQUIRED) {
     if (!raw[key]) {
       throw new Error(`Configuration is missing "${key}".`);
     }
   }
-  if (raw.jiraApiBase !== undefined && !/^https:\/\/[^\s/]+(\/\S*)?[^/]$/.test(raw.jiraApiBase)) {
-    throw new Error('"jiraApiBase" must be an https URL without a trailing slash.');
+  if (raw.jiraApiBase !== undefined && !isPlainHttpsBase(raw.jiraApiBase)) {
+    throw new Error('"jiraApiBase" must be an https URL with no query, fragment, credentials or trailing slash.');
   }
   if (!Array.isArray(raw.repositories) || !raw.repositories.length) {
     throw new Error('Configuration needs at least one repository.');
