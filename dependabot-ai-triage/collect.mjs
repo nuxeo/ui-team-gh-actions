@@ -723,7 +723,7 @@ async function reconcileAndPlan(ctx, inventory) {
 
 function defaultClients(config) {
   return {
-    jira: jiraClient({ site: config.jiraSite, email: env('JIRA_EMAIL'), token: env('JIRA_API_TOKEN') }),
+    jira: jiraClient({ site: config.jiraApi, email: env('JIRA_EMAIL'), token: env('JIRA_API_TOKEN') }),
     github: githubClient(env('GH_TOKEN')),
     npm: npmClient(),
     probe: anonymouslyReadable,

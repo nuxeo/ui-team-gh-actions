@@ -1494,7 +1494,7 @@ export async function apply(jiraOverride) {
   const outcome = emptyOutcome(inventory);
   const jira =
     jiraOverride ??
-    jiraClient({ site: config.jiraSite, email: process.env.JIRA_EMAIL, token: process.env.JIRA_API_TOKEN });
+    jiraClient({ site: config.jiraApi, email: process.env.JIRA_EMAIL, token: process.env.JIRA_API_TOKEN });
   const plan = preparePlan(work, inventory, config, outcome);
   if (inventory.lockAcquired) {
     await runWithLock({ jira, control: new ControlState(jira, config.controlIssue), config, inventory, outcome, plan });

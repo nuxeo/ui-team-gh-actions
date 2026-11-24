@@ -1,6 +1,7 @@
 {
   "schemaVersion": 1,
   "jiraSite": "https://hyland.atlassian.net",
+  "jiraApiBase": "https://api.atlassian.com/ex/jira/252cce86-035e-4b0e-abd2-3c002935632f",
   "controlIssue": "WEBUI-2435",
   "controlSecurityLevelId": "11176",
   "issueTypeId": "10004",

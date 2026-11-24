@@ -21,6 +21,9 @@ function validate(raw) {
       throw new Error(`Configuration is missing "${key}".`);
     }
   }
+  if (raw.jiraApiBase !== undefined && !/^https:\/\/[^\s/]+(\/\S*)?[^/]$/.test(raw.jiraApiBase)) {
+    throw new Error('"jiraApiBase" must be an https URL without a trailing slash.');
+  }
   if (!Array.isArray(raw.repositories) || !raw.repositories.length) {
     throw new Error('Configuration needs at least one repository.');
   }
@@ -80,6 +83,9 @@ export function loadConfig(file, env = process.env) {
     epicQuarter,
     mode,
     modeReason,
+    // REST calls go to `jiraApiBase` when set (the api.atlassian.com gateway that scoped tokens of Atlassian service
+    // accounts require); links and the anonymous-access probe always use the site itself.
+    jiraApi: raw.jiraApiBase || raw.jiraSite,
     configRevision: shortHash({ raw, epic, epicQuarter }),
     repositoryConfig(name) {
       const repo = raw.repositories.find((item) => item.name === name);
