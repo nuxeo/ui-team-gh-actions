@@ -1932,10 +1932,18 @@ test('Jira REST calls go to jiraApiBase when set, links stay on the site, and th
   ]) {
     assert.throws(() => loadConfig(write({ ...raw, jiraApiBase: bad }), {}), /jiraApiBase/);
   }
+  // Authenticated calls must use the gateway; the anonymous probe must stay on the site and carry no credentials.
   const original = globalThis.fetch;
-  const urls = [];
-  globalThis.fetch = async (url) => {
-    urls.push(String(url));
+  const calls = [];
+  const controlPath = `/rest/api/3/issue/${raw.controlIssue}?`;
+  globalThis.fetch = async (url, init) => {
+    const target = String(url);
+    const authenticated = Boolean(init?.headers?.Authorization);
+    calls.push({ url: target, authenticated });
+    if (authenticated && target.startsWith(`${gateway}${controlPath}`)) {
+      const fields = { security: { id: raw.controlSecurityLevelId }, labels: ['dependabot-ai-triage-control'] };
+      return new Response(JSON.stringify({ key: raw.controlIssue, fields }), { status: 200 });
+    }
     return new Response('{}', { status: 404 });
   };
   try {
@@ -1954,9 +1962,46 @@ test('Jira REST calls go to jiraApiBase when set, links stay on the site, and th
   } finally {
     globalThis.fetch = original;
   }
-  const jira = urls.filter((url) => url.includes('/rest/api/3/'));
+  const jira = calls.filter((call) => call.url.includes('/rest/api/3/'));
+  const probe = jira.filter((call) => !call.authenticated);
+  assert.deepEqual(
+    probe.map((call) => call.url),
+    [`${raw.jiraSite}${controlPath}fields=summary`],
+  );
+  const authenticated = jira.filter((call) => call.authenticated);
+  assert.ok(authenticated.length > 1, 'collection continued past the control issue read');
+  assert.ok(authenticated.every((call) => call.url.startsWith(`${gateway}/rest/api/3/`)));
+});
+
+test('apply() without an injected client calls Jira through jiraApiBase', async () => {
+  const raw = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
+  const gateway = 'https://api.atlassian.com/ex/jira/cloud-2';
+  const file = path.join(mkdtempSync(path.join(tmpdir(), 'dat-config-')), 'config.json');
+  writeFileSync(file, JSON.stringify({ ...raw, jiraApiBase: gateway }));
+  const original = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), authenticated: Boolean(init?.headers?.Authorization) });
+    return new Response('{}', { status: 404 });
+  };
+  try {
+    const work = workDir(baseInventory({ lockAcquired: true }));
+    await withEnv(
+      {
+        TRIAGE_WORK_DIR: work,
+        TRIAGE_CONFIG: file,
+        JIRA_EMAIL: 'bot@serviceaccount.atlassian.com',
+        JIRA_API_TOKEN: 'x',
+      },
+      () => apply(),
+    );
+  } finally {
+    globalThis.fetch = original;
+    process.exitCode = 0;
+  }
+  const jira = calls.filter((call) => call.authenticated && call.url.includes('/rest/api/3/'));
   assert.ok(jira.length > 0);
-  assert.ok(jira.every((url) => url.startsWith(`${gateway}/rest/api/3/`)));
+  assert.ok(jira.every((call) => call.url.startsWith(`${gateway}/rest/api/3/`)));
 });
 
 test('a priority mapping outside the configured order is rejected', () => {
